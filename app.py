@@ -268,4 +268,120 @@ async def fetch_and_post_news(application: Application):
 
             # Подпись к фото в Telegram ограничена по длине.
             try:
-                if image_url and len
+                if image_url and len(post_text) <= 1024:
+                    await application.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=image_url,
+                        caption=post_text,
+                    )
+                    print(f"✅ Опубликовано с фото: {title}")
+
+                elif image_url:
+                    await application.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=image_url,
+                    )
+                    await application.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=post_text[:4096],
+                    )
+                    print(f"✅ Опубликовано фото и текст: {title}")
+
+                else:
+                    await application.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=post_text[:4096],
+                    )
+                    print(f"✅ Опубликовано без фото: {title}")
+
+            except Exception as send_error:
+                print(f"⚠️ Не удалось отправить фото: {send_error}")
+
+                # Если фото не отправилось, пробуем отправить сам текст.
+                await application.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=post_text[:4096],
+                )
+                print(f"✅ Текст отправлен без фото: {title}")
+
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            print(f"❌ Ошибка при обработке {feed_url}: {type(e).__name__}: {e}")
+
+
+# --- Расписание ---
+
+async def news_scheduler(application: Application):
+    while True:
+        try:
+            if not is_posting_time():
+                wait_time = seconds_until_10am()
+                print(
+                    f"⏰ Сейчас вне окна публикаций. "
+                    f"Следующая проверка через {wait_time} секунд."
+                )
+                await asyncio.sleep(wait_time)
+                continue
+
+            await fetch_and_post_news(application)
+
+            # Проверяем ленты примерно раз в час.
+            if is_posting_time():
+                await asyncio.sleep(3600)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"❌ Ошибка планировщика: {type(e).__name__}: {e}")
+            await asyncio.sleep(60)
+
+
+# --- Команда /start ---
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.message:
+        await update.message.reply_text(
+            "Бот запущен. Публикации выходят с 10:00 до 22:00."
+        )
+
+
+# --- Запуск и остановка приложения ---
+
+async def post_init(application: Application):
+    application.bot_data["scheduler_task"] = asyncio.create_task(
+        news_scheduler(application)
+    )
+
+
+async def post_shutdown(application: Application):
+    task = application.bot_data.get("scheduler_task")
+
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def main():
+    threading.Thread(
+        target=run_flask,
+        daemon=True,
+    ).start()
+
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
