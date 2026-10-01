@@ -3,6 +3,7 @@ import re
 import html
 import asyncio
 import threading
+import calendar
 
 import feedparser
 from flask import Flask
@@ -31,8 +32,7 @@ if not TELEGRAM_TOKEN:
 if not CHANNEL_ID:
     raise RuntimeError("В Render не задана переменная CHANNEL_ID")
 
-# Без ключа Groq бот сможет отправлять текст из RSS,
-# но не сможет переписывать его с помощью AI.
+# Если GROQ_API_KEY отсутствует, бот попробует использовать описание из RSS.
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
@@ -47,8 +47,7 @@ RSS_FEEDS = [
 ]
 
 
-# Не публиковать одну и ту же запись повторно,
-# пока процесс бота работает.
+# Записи, уже опубликованные с момента запуска процесса.
 published_items = set()
 
 
@@ -97,6 +96,31 @@ def get_entry_summary(entry):
     return clean_html(summary)[:1200]
 
 
+def get_entry_timestamp(entry):
+    """Возвращает время записи для сравнения RSS-новостей."""
+    parsed_date = (
+        getattr(entry, "published_parsed", None)
+        or getattr(entry, "updated_parsed", None)
+    )
+
+    if parsed_date:
+        try:
+            return calendar.timegm(parsed_date)
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    # Если у RSS нет даты — такая запись будет иметь самый низкий приоритет.
+    return 0
+
+
+def get_entry_id(entry, feed_url, title):
+    return (
+        getattr(entry, "id", None)
+        or getattr(entry, "link", None)
+        or f"{feed_url}:{title}"
+    )
+
+
 # --- Создание текста через Groq ---
 
 def rewrite_with_ai(title, summary):
@@ -142,7 +166,9 @@ def rewrite_with_ai(title, summary):
         result = result.strip()
         result = re.sub(r"https?://\S+", "", result).strip()
 
-        if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", result)) < 10:
+        # Не используем ответ, если он слишком короткий или пустой по смыслу.
+        meaningful_chars = re.sub(r"[^\wа-яА-ЯёЁ]+", "", result)
+        if len(meaningful_chars) < 10:
             print(f"⚠️ Ответ Groq слишком короткий: {result!r}")
             return None
 
@@ -153,7 +179,21 @@ def rewrite_with_ai(title, summary):
         return None
 
 
-# --- Поиск изображения в RSS ---
+def make_post_text(title, summary):
+    ai_text = rewrite_with_ai(title, summary)
+
+    if ai_text:
+        return ai_text
+
+    if summary:
+        print(f"⚠️ Использую описание RSS вместо AI: {title}")
+        return f"⚡ {title}\n\n{summary}"
+
+    print(f"⏭️ Запись пропущена: нет описания и AI не создал текст — {title}")
+    return None
+
+
+# --- Поиск картинки в RSS ---
 
 def extract_image(entry, summary_html=""):
     for field in ("media_content", "media_thumbnail"):
@@ -179,123 +219,132 @@ def extract_image(entry, summary_html=""):
     return match.group(1) if match else None
 
 
-# --- Подготовка текста поста ---
+# --- Поиск одной самой свежей неопубликованной записи ---
 
-def make_post_text(title, summary):
-    ai_text = rewrite_with_ai(title, summary)
+async def find_one_new_entry():
+    best_candidate = None
+    best_score = None
 
-    if ai_text:
-        return ai_text
-
-    if summary:
-        print(f"⚠️ Использую описание RSS вместо AI: {title}")
-        return f"⚡ {title}\n\n{summary}"
-
-    print(f"⏭️ Запись пропущена: нет текста для публикации — {title}")
-    return None
-
-
-# --- Получение и публикация записей ---
-
-async def fetch_and_post_news(application: Application):
-    for feed_url in RSS_FEEDS:
+    for feed_index, feed_url in enumerate(RSS_FEEDS):
         try:
-            # feedparser — синхронная библиотека, поэтому запускаем её в потоке.
             feed = await asyncio.to_thread(feedparser.parse, feed_url)
 
             if not feed.entries:
                 print(f"⚠️ В RSS нет записей: {feed_url}")
                 continue
 
-            # Берём самую свежую запись из каждой ленты.
-            entry = feed.entries[0]
+            for entry_index, entry in enumerate(feed.entries):
+                title = clean_html(
+                    getattr(entry, "title", "") or ""
+                ) or "Без заголовка"
 
-            title = clean_html(
-                getattr(entry, "title", "") or ""
-            ) or "Без заголовка"
+                item_id = get_entry_id(entry, feed_url, title)
 
-            link = getattr(entry, "link", "") or ""
-            raw_summary = getattr(entry, "summary", "") or ""
-            summary = get_entry_summary(entry)
-            image_url = extract_image(entry, raw_summary)
+                if item_id in published_items:
+                    continue
 
-            # Ссылка — ключ записи для защиты от повторной публикации.
-            item_id = (
-                getattr(entry, "id", None)
-                or link
-                or f"{feed_url}:{title}"
+                timestamp = get_entry_timestamp(entry)
+
+                # При одинаковой дате сохраняем порядок RSS-лент.
+                score = (
+                    timestamp,
+                    -feed_index,
+                    -entry_index,
+                )
+
+                if best_candidate is None or score > best_score:
+                    best_candidate = {
+                        "entry": entry,
+                        "feed_url": feed_url,
+                        "title": title,
+                        "item_id": item_id,
+                    }
+                    best_score = score
+
+                # Обычно RSS отсортирован от новых записей к старым.
+                # Проверяем следующую ленту после первой неопубликованной записи.
+                break
+
+        except Exception as error:
+            print(
+                f"❌ Ошибка чтения {feed_url}: "
+                f"{type(error).__name__}: {error}"
             )
 
-            if item_id in published_items:
-                print(f"⏭️ Уже публиковали: {title}")
-                continue
+    return best_candidate
 
-            post_text = await asyncio.to_thread(
-                make_post_text,
-                title,
-                summary,
+
+# --- Публикация одной записи ---
+
+async def fetch_and_post_one_news(application: Application):
+    candidate = await find_one_new_entry()
+
+    if not candidate:
+        print("ℹ️ Новых неопубликованных записей не найдено")
+        return
+
+    entry = candidate["entry"]
+    title = candidate["title"]
+    item_id = candidate["item_id"]
+
+    raw_summary = getattr(entry, "summary", "") or ""
+    summary = get_entry_summary(entry)
+    image_url = extract_image(entry, raw_summary)
+
+    post_text = await asyncio.to_thread(
+        make_post_text,
+        title,
+        summary,
+    )
+
+    if not post_text:
+        return
+
+    try:
+        if image_url:
+            # У подписи к фото есть ограничение Telegram по длине.
+            await application.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=image_url,
+                caption=post_text[:1024],
             )
+            print(f"✅ Опубликована одна новость с фото: {title}")
 
-            # Не отправляем одну ссылку вместо содержательного поста.
-            if not post_text:
-                continue
+        else:
+            await application.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=post_text[:4096],
+            )
+            print(f"✅ Опубликована одна новость без фото: {title}")
 
+        # Запись считается опубликованной только после успешной отправки.
+        published_items.add(item_id)
+
+    except Exception as error:
+        print(f"❌ Не удалось отправить пост: {type(error).__name__}: {error}")
+
+        # Если отправка фото не удалась, пробуем отправить только текст.
+        if image_url:
             try:
-                if image_url and len(post_text) <= 1024:
-                    await application.bot.send_photo(
-                        chat_id=CHANNEL_ID,
-                        photo=image_url,
-                        caption=post_text,
-                    )
-                    print(f"✅ Опубликовано с фото: {title}")
-
-                elif image_url:
-                    await application.bot.send_photo(
-                        chat_id=CHANNEL_ID,
-                        photo=image_url,
-                    )
-                    await application.bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=post_text[:4096],
-                    )
-                    print(f"✅ Опубликовано фото и текст: {title}")
-
-                else:
-                    await application.bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=post_text[:4096],
-                    )
-                    print(f"✅ Опубликовано без фото: {title}")
-
-            except Exception as send_error:
-                print(f"⚠️ Не удалось отправить фото/пост: {send_error}")
-
-                # Если отправка фото не удалась, пробуем отправить текст.
                 await application.bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=post_text[:4096],
                 )
-                print(f"✅ Текст отправлен без фото: {title}")
-
-            # Отмечаем запись только после успешной отправки.
-            published_items.add(item_id)
-
-            # Небольшая пауза между публикациями.
-            await asyncio.sleep(5)
-
-        except Exception as error:
-            print(
-                f"❌ Ошибка при обработке {feed_url}: "
-                f"{type(error).__name__}: {error}"
-            )
+                published_items.add(item_id)
+                print(f"✅ Текст новости отправлен без фото: {title}")
+            except Exception as text_error:
+                print(
+                    f"❌ Не удалось отправить и текст: "
+                    f"{type(text_error).__name__}: {text_error}"
+                )
 
 
-# --- Планировщик: проверка каждый час, круглосуточно ---
+# --- Планировщик: одна новость за проход, раз в час ---
 
 async def news_scheduler(application: Application):
     while True:
         try:
-            await fetch_and_post_news(application)
+            await fetch_and_post_one_news(application)
             await asyncio.sleep(3600)
 
         except asyncio.CancelledError:
@@ -317,11 +366,11 @@ async def start(
 ):
     if update.message:
         await update.message.reply_text(
-            "Бот запущен и проверяет RSS каждый час."
+            "Бот запущен. Он публикует не больше одной новости за проход."
         )
 
 
-# --- Запуск фонового планировщика ---
+# --- Запуск и остановка фонового планировщика ---
 
 async def post_init(application: Application):
     application.bot_data["scheduler_task"] = asyncio.create_task(
