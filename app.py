@@ -9,14 +9,15 @@ from telegram.ext import Updater, CommandHandler
 
 # --- Конфигурация ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # Например, "@your_channel_name"
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+
 RSS_FEEDS = [
     "https://habr.com/ru/rss/all/all/",
     "https://tproger.ru/feed/",
     "https://the-flow.ru/rss/",
     "https://ixbt.games/rss/",
     "https://www.sports.ru/rss/all.xml"
-] # Замените на нужный RSS-источник
+]
 
 # --- Инициализация ---
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -32,54 +33,48 @@ def health():
     return "OK", 200
 
 def run_flask():
-    # Render предоставляет порт через переменную окружения PORT
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 
 # --- Логика бота ---
 def fetch_and_post_news():
-    """Функция для сбора и публикации новостей."""
-    feed = feedparser.parse(RSS_FEED_URL)
-    if feed.entries:
-        latest_entry = feed.entries[0]
-        title = latest_entry.title
-        link = latest_entry.link
-        # Простейшее форматирование. Можно улучшить с помощью AI.
-        message = f"✨ *{title}*\n\n[Читать далее]({link})"
+    """Функция для сбора и публикации новостей из списка RSS-лент."""
+    for feed_url in RSS_FEEDS:
         try:
-            bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='Markdown')
-            print(f"Опубликовано: {title}")
+            feed = feedparser.parse(feed_url)
+            if feed.entries:
+                latest_entry = feed.entries[0]
+                title = latest_entry.title
+                link = latest_entry.link
+                message = f"✨ *{title}*\n\n[Читать далее]({link})"
+                bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='Markdown')
+                print(f"Опубликовано из {feed_url}: {title}")
+                time.sleep(2)
         except Exception as e:
-            print(f"Ошибка при публикации: {e}")
+            print(f"Ошибка при обработке {feed_url}: {e}")
 
 def news_scheduler():
     """Планировщик для периодического запуска сбора новостей."""
     while True:
         fetch_and_post_news()
-        # Публикуем раз в час (3600 секунд). Можно изменить.
-        time.sleep(3600)
+        time.sleep(3600)  # раз в час
 
 def main():
-    # Запускаем Flask-сервер в отдельном потоке
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    
-    # Запускаем планировщик новостей в отдельном потоке
+
     news_thread = threading.Thread(target=news_scheduler)
     news_thread.daemon = True
     news_thread.start()
 
-    # Запускаем Telegram-бота (поллинг)
-    # Polling будет работать в основном потоке
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
-    
-    # Пример команды (необязательно)
+
     def start(update, context):
         update.message.reply_text('Бот-новостник запущен!')
     dp.add_handler(CommandHandler("start", start))
-    
+
     updater.start_polling()
     updater.idle()
 
