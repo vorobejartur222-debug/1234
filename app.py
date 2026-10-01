@@ -189,4 +189,173 @@ def make_post_text(title, summary):
 
     if summary:
         print(f"⚠️ Использую описание RSS вместо AI: {title}")
-        return
+        return f"⚡ {title}\n\n{summary}"
+
+    print(f"⏭️ Запись пропущена: нет текста для публикации — {title}")
+    return None
+
+
+# --- Получение и публикация записей ---
+
+async def fetch_and_post_news(application: Application):
+    for feed_url in RSS_FEEDS:
+        try:
+            # feedparser — синхронная библиотека, поэтому запускаем её в потоке.
+            feed = await asyncio.to_thread(feedparser.parse, feed_url)
+
+            if not feed.entries:
+                print(f"⚠️ В RSS нет записей: {feed_url}")
+                continue
+
+            # Берём самую свежую запись из каждой ленты.
+            entry = feed.entries[0]
+
+            title = clean_html(
+                getattr(entry, "title", "") or ""
+            ) or "Без заголовка"
+
+            link = getattr(entry, "link", "") or ""
+            raw_summary = getattr(entry, "summary", "") or ""
+            summary = get_entry_summary(entry)
+            image_url = extract_image(entry, raw_summary)
+
+            # Ссылка — ключ записи для защиты от повторной публикации.
+            item_id = (
+                getattr(entry, "id", None)
+                or link
+                or f"{feed_url}:{title}"
+            )
+
+            if item_id in published_items:
+                print(f"⏭️ Уже публиковали: {title}")
+                continue
+
+            post_text = await asyncio.to_thread(
+                make_post_text,
+                title,
+                summary,
+            )
+
+            # Не отправляем одну ссылку вместо содержательного поста.
+            if not post_text:
+                continue
+
+            try:
+                if image_url and len(post_text) <= 1024:
+                    await application.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=image_url,
+                        caption=post_text,
+                    )
+                    print(f"✅ Опубликовано с фото: {title}")
+
+                elif image_url:
+                    await application.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=image_url,
+                    )
+                    await application.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=post_text[:4096],
+                    )
+                    print(f"✅ Опубликовано фото и текст: {title}")
+
+                else:
+                    await application.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=post_text[:4096],
+                    )
+                    print(f"✅ Опубликовано без фото: {title}")
+
+            except Exception as send_error:
+                print(f"⚠️ Не удалось отправить фото/пост: {send_error}")
+
+                # Если отправка фото не удалась, пробуем отправить текст.
+                await application.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=post_text[:4096],
+                )
+                print(f"✅ Текст отправлен без фото: {title}")
+
+            # Отмечаем запись только после успешной отправки.
+            published_items.add(item_id)
+
+            # Небольшая пауза между публикациями.
+            await asyncio.sleep(5)
+
+        except Exception as error:
+            print(
+                f"❌ Ошибка при обработке {feed_url}: "
+                f"{type(error).__name__}: {error}"
+            )
+
+
+# --- Планировщик: проверка каждый час, круглосуточно ---
+
+async def news_scheduler(application: Application):
+    while True:
+        try:
+            await fetch_and_post_news(application)
+            await asyncio.sleep(3600)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as error:
+            print(
+                f"❌ Ошибка планировщика: "
+                f"{type(error).__name__}: {error}"
+            )
+            await asyncio.sleep(60)
+
+
+# --- Команда /start ---
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.message:
+        await update.message.reply_text(
+            "Бот запущен и проверяет RSS каждый час."
+        )
+
+
+# --- Запуск фонового планировщика ---
+
+async def post_init(application: Application):
+    application.bot_data["scheduler_task"] = asyncio.create_task(
+        news_scheduler(application)
+    )
+
+
+async def post_shutdown(application: Application):
+    task = application.bot_data.get("scheduler_task")
+
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+# --- Запуск приложения ---
+
+def main():
+    threading.Thread(
+        target=run_flask,
+        daemon=True,
+    ).start()
+
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
