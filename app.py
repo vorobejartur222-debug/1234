@@ -10,7 +10,13 @@ from telegram.ext import Updater, CommandHandler
 # --- Конфигурация ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")  # Например, "@your_channel_name"
-RSS_FEED_URL = "https://example.com/rss"  # Замените на нужный RSS-источник
+RSS_FEEDS = [
+    "https://habr.com/ru/rss/all/all/",
+    "https://tproger.ru/feed/",
+    "https://the-flow.ru/rss/",
+    "https://ixbt.games/rss/",
+    "https://www.sports.ru/rss/all.xml"
+] # Замените на нужный RSS-источник
 
 # --- Инициализация ---
 bot = Bot(token=TELEGRAM_TOKEN)
