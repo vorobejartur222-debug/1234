@@ -1,53 +1,64 @@
 import os
-import threading
-import time
 import re
+import html
+import asyncio
+import threading
+
 import feedparser
 from flask import Flask
-from telegram import Bot
-from telegram.ext import Updater, CommandHandler
 from groq import Groq
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
 
 # --- Конфигурация ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Не задана переменная окружения TELEGRAM_TOKEN")
+if not CHANNEL_ID:
+    raise RuntimeError("Не задана переменная окружения CHANNEL_ID")
+if not GROQ_API_KEY:
+    raise RuntimeError("Не задана переменная окружения GROQ_API_KEY")
+
 RSS_FEEDS = [
     "https://habr.com/ru/rss/all/all/",
     "https://tproger.ru/feed/",
     "https://the-flow.ru/rss/",
     "https://ixbt.games/rss/",
-    "https://www.sports.ru/rss/all.xml"
+    "https://www.sports.ru/rss/all.xml",
 ]
 
-# --- Инициализация ---
-bot = Bot(token=TELEGRAM_TOKEN)
-app = Flask(__name__)
+flask_app = Flask(__name__)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# --- Веб-сервер для keep-alive ---
-@app.route('/')
+
+# --- Веб-сервер Render ---
+@flask_app.route("/")
 def home():
     return "Bot is running", 200
 
-@app.route('/health')
+
+@flask_app.route("/health")
 def health():
     return "OK", 200
 
+
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    flask_app.run(host="0.0.0.0", port=port)
 
-# --- Функция переписывания текста через AI ---
+
+# --- Переписывание текста через Groq ---
 def rewrite_with_ai(title, summary=""):
-    """Переписывает новость в стиле молодёжного канала."""
     prompt = f"""Ты — автор позитивного молодёжного Telegram-канала о новостях.
 Перепиши эту новость в короткий, энергичный пост.
-Добавь 2-3 подходящих эмодзи. Пиши на русском, неформально, с легким юмором.
-Не используй слово "новость" и не пиши "вот новость".
+Добавь 2-3 подходящих эмодзи. Пиши на русском, неформально, с лёгким юмором.
+Не используй слово «новость» и не пиши «вот новость».
 Сделай текст не длиннее 3-4 предложений.
-Вот заголовок: {title}
+Заголовок: {title}
 Краткое описание: {summary}
 
 Твой пост:"""
@@ -57,114 +68,150 @@ def rewrite_with_ai(title, summary=""):
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.8,
-            max_tokens=250
+            max_tokens=250,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"Ошибка AI: {e}")
         return None
 
-# --- Функция поиска картинки в RSS ---
+
+# --- Поиск картинки в RSS ---
 def extract_image(entry, summary_html=""):
-    """Пытается вытащить картинку из записи RSS."""
-    # Вариант А: media_content
-    if hasattr(entry, 'media_content') and entry.media_content:
-        for media in entry.media_content:
-            url = media.get('url')
+    for field in ("media_content", "media_thumbnail"):
+        media_items = getattr(entry, field, None) or []
+        for media in media_items:
+            url = media.get("url")
             if url:
                 return url
 
-    # Вариант Б: media_thumbnail
-    if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
-        for media in entry.media_thumbnail:
-            url = media.get('url')
+    for enclosure in getattr(entry, "enclosures", None) or []:
+        if "image" in enclosure.get("type", ""):
+            url = enclosure.get("href")
             if url:
                 return url
 
-    # Вариант В: enclosures
-    if hasattr(entry, 'enclosures') and entry.enclosures:
-        for enc in entry.enclosures:
-            if 'image' in enc.get('type', ''):
-                return enc.get('href')
+    match = re.search(
+        r"""<img[^>]+src=["']([^"']+)["']""",
+        summary_html,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match else None
 
-    # Вариант Г: ищем <img> в HTML описания
-    if summary_html:
-        img_match = re.search(r'<img[^>]+src="([^"]+)"', summary_html)
-        if img_match:
-            return img_match.group(1)
 
-    return None
-
-# --- Основная логика ---
-def fetch_and_post_news():
+# --- Публикация новостей ---
+async def fetch_and_post_news(application: Application):
     for feed_url in RSS_FEEDS:
         try:
-            feed = feedparser.parse(feed_url)
+            # feedparser и Groq синхронные — выполняем их вне event loop.
+            feed = await asyncio.to_thread(feedparser.parse, feed_url)
+
             if not feed.entries:
+                print(f"Нет записей в RSS: {feed_url}")
                 continue
 
-            latest_entry = feed.entries[0]
-            title = latest_entry.title
-            link = latest_entry.link
+            entry = feed.entries[0]
+            title = getattr(entry, "title", "Без заголовка")
+            link = getattr(entry, "link", "")
+            raw_summary = getattr(entry, "summary", "")
 
-            # Достаём HTML описания и чистим для AI
-            raw_summary = getattr(latest_entry, 'summary', '')
-            clean_summary = re.sub('<[^<]+?>', '', raw_summary)
-            clean_summary = clean_summary[:400]
+            clean_summary = re.sub(r"<[^>]+>", " ", raw_summary)
+            clean_summary = html.unescape(clean_summary)
+            clean_summary = re.sub(r"\s+", " ", clean_summary).strip()[:400]
 
-            # Картинка — из RSS
-            image_url = extract_image(latest_entry, raw_summary)
+            image_url = extract_image(entry, raw_summary)
+            ai_text = await asyncio.to_thread(
+                rewrite_with_ai, title, clean_summary
+            )
 
-            # Текст — через AI
-            ai_text = rewrite_with_ai(title, clean_summary)
             if not ai_text:
-                ai_text = f"✨ *{title}*\n\n🔗 [Читать далее]({link})"
+                ai_text = f"✨ {title}"
+                if link:
+                    ai_text += f"\n\nЧитать далее: {link}"
 
-            # Публикация
-            if image_url:
-                try:
-                    bot.send_photo(
+            try:
+                if image_url and len(ai_text) <= 1024:
+                    await application.bot.send_photo(
                         chat_id=CHANNEL_ID,
                         photo=image_url,
                         caption=ai_text,
-                        parse_mode='Markdown'
                     )
                     print(f"✅ Опубликовано с фото: {title}")
-                except Exception as e:
-                    print(f"⚠️ Фото не загрузилось ({e}), отправляю текстом")
-                    bot.send_message(chat_id=CHANNEL_ID, text=ai_text, parse_mode='Markdown')
-            else:
-                bot.send_message(chat_id=CHANNEL_ID, text=ai_text, parse_mode='Markdown')
-                print(f"✅ Опубликовано без фото: {title}")
+                elif image_url:
+                    await application.bot.send_photo(
+                        chat_id=CHANNEL_ID,
+                        photo=image_url,
+                    )
+                    await application.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=ai_text[:4096],
+                    )
+                    print(f"✅ Опубликовано с фото и отдельным текстом: {title}")
+                else:
+                    await application.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=ai_text[:4096],
+                    )
+                    print(f"✅ Опубликовано без фото: {title}")
 
-            time.sleep(5)
+            except Exception as photo_error:
+                print(f"⚠️ Не удалось отправить фото/пост: {photo_error}")
+                await application.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=ai_text[:4096],
+                )
+
+            await asyncio.sleep(5)
 
         except Exception as e:
             print(f"❌ Ошибка при обработке {feed_url}: {e}")
 
-def news_scheduler():
+
+async def news_scheduler(application: Application):
     while True:
-        fetch_and_post_news()
-        time.sleep(3600)  # раз в час
+        await fetch_and_post_news(application)
+        await asyncio.sleep(3600)
+
+
+# --- Команда /start ---
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.message:
+        await update.message.reply_text(
+            "Бот-новостник с AI и фото запущен!"
+        )
+
+
+# --- Запуск и остановка фонового расписания ---
+async def post_init(application: Application):
+    application.bot_data["scheduler_task"] = asyncio.create_task(
+        news_scheduler(application)
+    )
+
+
+async def post_shutdown(application: Application):
+    task = application.bot_data.get("scheduler_task")
+    if task:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
 
 def main():
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    news_thread = threading.Thread(target=news_scheduler)
-    news_thread.daemon = True
-    news_thread.start()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    application.add_handler(CommandHandler("start", start))
+    application.run_polling()
 
-    def start(update, context):
-        update.message.reply_text('Бот-новостник с AI и фото запущен!')
-    dp.add_handler(CommandHandler("start", start))
-
-    updater.start_polling()
-    updater.idle()
 
 if __name__ == "__main__":
     main()
