@@ -55,7 +55,7 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 # ---------- RSS-ленты ----------
 
 RSS_FEEDS = [
-    "https://habr.com/ru/rss/all/all/",
+    "https://www.ixbt.com/export/news.rss",
     "https://tproger.ru/feed/",
     "https://the-flow.ru/rss/",
     "https://ixbt.games/rss/",
