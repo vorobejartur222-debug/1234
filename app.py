@@ -87,8 +87,6 @@ def init_db():
             )
         """)
 
-        # Если процесс прервался во время отправки в канал,
-        # новость снова станет доступна для подтверждения.
         db.execute("""
             UPDATE news
             SET status = 'pending'
@@ -262,12 +260,15 @@ def rewrite_with_ai(title, summary):
         print("⚠️ GROQ_API_KEY не задан — AI недоступен")
         return None
 
+    # ИЗМЕНЕНО: добавили явное ограничение по длине,
+    # чтобы текст гарантированно влезал в подпись к фото (1024 символа).
     prompt = f"""Ты — автор позитивного молодёжного Telegram-канала.
 Напиши самостоятельный короткий пост на русском языке по заголовку и описанию.
 Пиши живо, неформально, с лёгким юмором и 2-3 подходящими эмодзи.
 Раскрой смысл новости, а не просто повтори заголовок.
 Не добавляй ссылки и не придумывай факты.
 Не более 3-4 предложений.
+ВАЖНО: длина итогового текста не должна превышать 800 символов.
 
 Заголовок: {title}
 Описание: {summary}
@@ -279,7 +280,7 @@ def rewrite_with_ai(title, summary):
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.8,
-            max_tokens=250,
+            max_tokens=300,
         )
 
         if not response.choices:
@@ -293,6 +294,12 @@ def rewrite_with_ai(title, summary):
             return None
 
         result = re.sub(r"https?://\S+", "", result.strip()).strip()
+
+        # ИЗМЕНЕНО: страховка — если AI всё равно переборщил с длиной,
+        # аккуратно обрезаем до 1000 символов.
+        if len(result) > 1000:
+            print(f"⚠️ AI вернул слишком длинный текст ({len(result)}), обрезаю")
+            result = result[:997].rstrip() + "..."
 
         if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", result)) < 10:
             print(f"⚠️ Ответ Groq слишком короткий: {result!r}")
@@ -313,7 +320,10 @@ def make_post_text(title, summary):
 
     if summary:
         print(f"⚠️ Использую описание RSS вместо AI: {title}")
-        return f"⚡ {title}\n\n{summary}"
+        fallback = f"⚡ {title}\n\n{summary}"
+        # ИЗМЕНЕНО: тоже ограничиваем длину fallback-текста.
+        return fallback[:1000]
+
 
     return None
 
@@ -347,7 +357,6 @@ async def find_one_new_entry():
                     "entry_index": entry_index,
                 })
 
-                # Обычно записи в ленте идут от новых к старым.
                 break
 
         except Exception as error:
@@ -359,7 +368,6 @@ async def find_one_new_entry():
     if not candidates:
         return None
 
-    # Выбираем самую свежую запись из проверенных лент.
     return max(
         candidates,
         key=lambda item: (
@@ -375,7 +383,6 @@ async def find_one_new_entry():
 async def send_for_review(application, item):
     item_id = item["id"]
 
-    # Проверяем, что заявка всё ещё ожидает решения.
     if not item_is_pending(item_id):
         return
 
@@ -398,11 +405,35 @@ async def send_for_review(application, item):
         ]
     ])
 
-    await application.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=message_text[:4096],
-        reply_markup=keyboard,
-    )
+    # ИЗМЕНЕНО: если у новости есть картинка, отправляем превью с фото,
+    # чтобы админ видел, как пост будет выглядеть в канале.
+    image_url = item["image_url"]
+
+    if image_url:
+        try:
+            await application.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=image_url,
+                caption=message_text[:1024],
+                reply_markup=keyboard,
+            )
+        except Exception as photo_error:
+            print(
+                f"⚠️ Не удалось отправить превью с фото: "
+                f"{type(photo_error).__name__}: {photo_error}"
+            )
+            # Фолбэк: отправляем просто текстом
+            await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=message_text[:4096],
+                reply_markup=keyboard,
+            )
+    else:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message_text[:4096],
+            reply_markup=keyboard,
+        )
 
     set_notified(item_id)
     print(f"📩 Новость отправлена админу на проверку: {item['title']}")
@@ -457,15 +488,12 @@ async def review_callback(
         await query.edit_message_text("Неизвестное действие.")
         return
 
-    # Защита от повторного нажатия во время отправки.
     set_item_status(item_id, "publishing")
 
     try:
         post_text = item["post_text"]
         image_url = item["image_url"]
 
-        # Если текст слишком длинный для подписи к фото,
-        # публикуем его обычным сообщением.
         if image_url and len(post_text) <= 1024:
             try:
                 await context.bot.send_photo(
@@ -524,7 +552,6 @@ async def news_scheduler(application: Application):
                             f"{type(error).__name__}: {error}"
                         )
 
-                # Не ищем новую, пока админ не решит судьбу текущей.
                 await asyncio.sleep(60)
                 continue
 
