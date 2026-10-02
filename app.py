@@ -96,9 +96,11 @@ def init_db():
             )
         """)
 
+        # Новость, застрявшая в 'publishing' после падения,
+        # возвращается в 'pending' и снова уведомляется админу.
         db.execute("""
             UPDATE news
-            SET status = 'pending'
+            SET status = 'pending', notified = 0
             WHERE status = 'publishing'
         """)
 
@@ -727,11 +729,16 @@ async def start(
     await update.message.reply_text(
         "Бот подключён. Новости будут приходить сюда на проверку.\n\n"
         "Команды:\n"
-        "/now — прислать новость прямо сейчас, не дожидаясь таймера."
+        "/now — прислать новость прямо сейчас, не дожидаясь таймера.\n"
+        "/pending — показать, что висит в очереди.\n"
+        "/reset — сбросить зависшую новость."
     )
 
 
-async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def force_fetch(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     """/now — принудительно ищет и присылает новость."""
     if not update.effective_user or not update.message:
         return
@@ -744,7 +751,7 @@ async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending:
         await update.message.reply_text(
             "⚠️ У тебя уже есть новость на проверке. "
-            "Сначала опубликуй или пропусти её."
+            "Сначала опубликуй, пропусти её — или сбрось через /reset."
         )
         return
 
@@ -763,6 +770,67 @@ async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def show_pending(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """/pending — показать, что висит в очереди."""
+    if not update.effective_user or not update.message:
+        return
+
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    pending = get_pending_item()
+
+    if not pending:
+        await update.message.reply_text(
+            "✅ Очередь пуста — ничего не висит."
+        )
+        return
+
+    text = (
+        f"📋 В очереди:\n\n"
+        f"ID: {pending['id']}\n"
+        f"Заголовок: {pending['title']}\n"
+        f"Уведомлён: {'да' if pending['notified'] else 'нет'}\n"
+        f"Есть фото: {'да' if pending['image_url'] else 'нет'}\n"
+        f"Создано: {pending['created_at']}\n\n"
+        f"Текст:\n{pending['post_text'][:500]}"
+    )
+
+    await update.message.reply_text(text[:4096])
+
+
+async def reset_pending(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """/reset — сбросить зависшую новость из очереди."""
+    if not update.effective_user or not update.message:
+        return
+
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    pending = get_pending_item()
+
+    if not pending:
+        await update.message.reply_text(
+            "✅ Очередь и так пуста — нечего сбрасывать."
+        )
+        return
+
+    set_item_status(pending["id"], "skipped")
+    await update.message.reply_text(
+        f"🗑 Сброшено: {pending['title']}\n\n"
+        f"Теперь можешь нажать /now или подождать таймер."
+    )
+    print(f"🗑 Админ сбросил pending: {pending['title']}")
+
+
 # ---------- Запуск ----------
 
 async def post_init(application: Application):
@@ -773,6 +841,8 @@ async def post_init(application: Application):
     await application.bot.set_my_commands([
         ("start", "Запустить бота"),
         ("now", "Прислать новость сейчас"),
+        ("pending", "Показать, что висит в очереди"),
+        ("reset", "Сбросить зависшую новость"),
     ])
 
 
@@ -802,6 +872,8 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("now", force_fetch))
+    application.add_handler(CommandHandler("pending", show_pending))
+    application.add_handler(CommandHandler("reset", reset_pending))
     application.add_handler(
         CallbackQueryHandler(
             review_callback,
