@@ -7,8 +7,8 @@ import random
 import asyncio
 import threading
 import hashlib
-import calendar
 import time
+import uuid
 
 import requests
 import feedparser
@@ -36,7 +36,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")  # e.g. "user/repo"
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json")
 
 if not TELEGRAM_TOKEN:
@@ -75,7 +75,7 @@ RSS_FEEDS = [
 ]
 
 
-# ---------- GitHub-хранилище (JSON) ----------
+# ---------- GitHub-хранилище ----------
 
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -83,9 +83,14 @@ GH_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-_data_cache = None
+DEFAULT_DATA = {"items": [], "last_feed_index": 0}
+
+_data_cache = dict(DEFAULT_DATA)
 _data_sha = None
 _data_lock = asyncio.Lock()
+
+# Очередь новостей, ожидающих проверки (в памяти)
+pending_queue = {}
 
 
 def _gh_url(path=""):
@@ -93,112 +98,137 @@ def _gh_url(path=""):
 
 
 def _load_data_sync():
-    """Читает JSON из GitHub. Возвращает (data, sha)."""
     global _data_cache, _data_sha
 
-    response = requests.get(
-        _gh_url(GITHUB_DATA_FILE),
-        headers=GH_HEADERS,
-        timeout=15,
-    )
+    try:
+        response = requests.get(
+            _gh_url(GITHUB_DATA_FILE),
+            headers=GH_HEADERS,
+            timeout=15,
+        )
 
-    if response.status_code == 404:
-        # Файла нет — создаём пустую структуру
-        default = {"items": [], "last_feed_index": 0}
-        return default, None
+        if response.status_code == 404:
+            print("⚠️ seen_news.json не найден, начинаю с пустой базы")
+            _data_cache = dict(DEFAULT_DATA)
+            _data_sha = None
+            return _data_cache
 
-    response.raise_for_status()
-    payload = response.json()
+        if response.status_code != 200:
+            print(
+                f"⚠️ GitHub вернул {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+            _data_cache = dict(DEFAULT_DATA)
+            _data_sha = None
+            return _data_cache
 
-    content = base64.b64decode(payload["content"]).decode("utf-8")
-    data = json.loads(content)
-    sha = payload["sha"]
+        payload = response.json()
+        content = base64.b64decode(payload["content"]).decode("utf-8")
+        loaded = json.loads(content)
 
-    _data_cache = data
-    _data_sha = sha
-    return data, sha
+        if not isinstance(loaded, dict):
+            loaded = dict(DEFAULT_DATA)
+
+        loaded.setdefault("items", [])
+        loaded.setdefault("last_feed_index", 0)
+
+        _data_cache = loaded
+        _data_sha = payload["sha"]
+        return _data_cache
+
+    except Exception as error:
+        print(f"❌ Ошибка загрузки данных из GitHub: {error}")
+        _data_cache = dict(DEFAULT_DATA)
+        _data_sha = None
+        return _data_cache
 
 
-def _save_data_sync(data, sha=None):
-    """Сохраняет JSON в GitHub."""
-    global _data_cache, _data_sha
+def _save_data_sync():
+    global _data_sha
 
-    content = json.dumps(data, ensure_ascii=False, indent=2)
-    encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+    try:
+        content = json.dumps(_data_cache, ensure_ascii=False, indent=2)
+        encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
 
-    payload = {
-        "message": f"Update seen_news ({time.strftime('%Y-%m-%d %H:%M')})",
-        "content": encoded,
-        "committer": {
-            "name": "vibe-news-bot",
-            "email": "bot@vibe.news",
-        },
-    }
+        payload = {
+            "message": f"Update seen_news ({time.strftime('%Y-%m-%d %H:%M')})",
+            "content": encoded,
+            "committer": {
+                "name": "vibe-news-bot",
+                "email": "bot@vibe.news",
+            },
+        }
 
-    if sha:
-        payload["sha"] = sha
+        if _data_sha:
+            payload["sha"] = _data_sha
 
-    response = requests.put(
-        _gh_url(GITHUB_DATA_FILE),
-        headers=GH_HEADERS,
-        json=payload,
-        timeout=15,
-    )
+        response = requests.put(
+            _gh_url(GITHUB_DATA_FILE),
+            headers=GH_HEADERS,
+            json=payload,
+            timeout=15,
+        )
 
-    if response.status_code == 409:
-        # Конфликт: кто-то другой обновил файл — перечитываем и пробуем снова
-        print("⚠️ Конфликт при сохранении в GitHub, перечитываю...")
-        data, new_sha = _load_data_sync()
-        return _save_data_sync(data, new_sha)
+        if response.status_code == 409:
+            print("⚠️ Конфликт при сохранении, перечитываю...")
+            _load_data_sync()
+            return _save_data_sync()
 
-    response.raise_for_status()
-    result = response.json()
+        if response.status_code not in (200, 201):
+            print(
+                f"⚠️ Ошибка сохранения: {response.status_code} "
+                f"{response.text[:200]}"
+            )
+            return False
 
-    _data_cache = data
-    _data_sha = result["content"]["sha"]
-    return True
+        result = response.json()
+        _data_sha = result["content"]["sha"]
+        return True
+
+    except Exception as error:
+        print(f"❌ Ошибка сохранения данных: {error}")
+        return False
 
 
 async def load_data():
-    """Асинхронно читает данные."""
     async with _data_lock:
         return await asyncio.to_thread(_load_data_sync)
 
 
-async def save_data(data):
-    """Асинхронно сохраняет данные."""
-    global _data_sha
+async def save_data():
     async with _data_lock:
-        return await asyncio.to_thread(_save_data_sync, data, _data_sha)
+        return await asyncio.to_thread(_save_data_sync)
 
 
 def is_seen(item_key):
-    if _data_cache is None:
+    if not isinstance(_data_cache, dict):
         return False
     return item_key in _data_cache.get("items", [])
 
 
 def mark_seen(item_key):
-    if _data_cache is None:
+    if not isinstance(_data_cache, dict):
         return
     items = _data_cache.setdefault("items", [])
     if item_key not in items:
         items.append(item_key)
+    if len(items) > 2000:
+        _data_cache["items"] = items[-2000:]
 
 
 def get_last_feed_index():
-    if _data_cache is None:
+    if not isinstance(_data_cache, dict):
         return 0
     return int(_data_cache.get("last_feed_index", 0) or 0)
 
 
 def set_last_feed_index(index):
-    if _data_cache is None:
+    if not isinstance(_data_cache, dict):
         return
     _data_cache["last_feed_index"] = index
 
 
-# ---------- Flask для Render ----------
+# ---------- Flask ----------
 
 flask_app = Flask(__name__)
 
@@ -248,11 +278,6 @@ def get_item_key(entry, feed_url, title):
     return hashlib.sha256(source_id.encode("utf-8")).hexdigest()
 
 
-def get_title_hash(title):
-    normalized = re.sub(r"\W+", "", title.lower())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
 def extract_image(entry, summary_html=""):
     for field in ("media_content", "media_thumbnail"):
         for media in getattr(entry, field, None) or []:
@@ -292,24 +317,22 @@ def is_news_item(title, summary):
     return True
 
 
-# ---------- AI-текст ----------
+# ---------- AI ----------
 
 def rewrite_with_ai(title, summary):
     if not groq_client:
-        print("⚠️ GROQ_API_KEY не задан — AI недоступен")
         return None
 
     prompt = f"""Ты — автор позитивного молодёжного Telegram-канала.
 Напиши самостоятельный короткий пост на русском языке по заголовку и описанию.
 Пиши живо, неформально, с лёгким юмором.
 
-ПРАВИЛА ОФОРМЛЕНИЯ:
-- Начни пост с одного яркого эмодзи, который подходит по смыслу новости (например: 🚀, 🔥, 💡, 🎉, 🌟, 🤯, 😎, 💥, 🎮, 🎵, 🧠, 🌍, ✨).
-- Используй ещё 3-5 эмодзи по ходу текста, чтобы оживить его. Эмодзи должны подходить по смыслу, не ставь их наугад.
+ПРАВИЛА:
+- Начни с одного яркого эмодзи по смыслу новости (🚀, 🔥, 💡, 🎉, 🌟, 🤯, 😎, 💥, 🎮, 🎵, 🧠, 🌍, ✨).
+- Добавь ещё 3-5 эмодзи по ходу текста.
 - Не более 3-4 предложений.
-- Длина итогового текста — не более 800 символов.
+- До 800 символов.
 - Не добавляй ссылки и не придумывай факты.
-- Раскрой смысл новости, а не просто повтори заголовок.
 
 Заголовок: {title}
 Описание: {summary}
@@ -344,18 +367,20 @@ def make_post_text(title, summary):
     if ai_text:
         return ai_text
     if summary:
-        print(f"⚠️ Использую описание RSS вместо AI: {title}")
-        fallback = f"🔥 {title}\n\n{summary} ✨"
-        return fallback[:1000]
+        return f"🔥 {title}\n\n{summary} ✨"[:1000]
     return None
 
 
-# ---------- Поиск одной новой записи (случайная лента) ----------
+# ---------- Поиск новости ----------
 
 _find_lock = asyncio.Lock()
 
 
 async def find_one_new_entry():
+    global _data_cache
+    if not isinstance(_data_cache, dict):
+        _data_cache = dict(DEFAULT_DATA)
+
     async with _find_lock:
         total_feeds = len(RSS_FEEDS)
         feed_indices = list(range(total_feeds))
@@ -397,7 +422,7 @@ async def find_one_new_entry():
 
                 chosen = random.choice(fresh_entries)
                 set_last_feed_index((feed_index + 1) % total_feeds)
-                await save_data(_data_cache)
+                await save_data()
                 print(f"📡 Источник: {feed_url}")
                 return chosen
 
@@ -410,56 +435,7 @@ async def find_one_new_entry():
         return None
 
 
-# ---------- Отправка новости админу ----------
-
-async def send_for_review(application, item):
-    item_id = item["id"]
-    message_text = (
-        f"📬 Новость на проверку\n\n"
-        f"{item['post_text']}\n\n"
-        f"Источник: {item['source_url'] or 'ссылка не указана'}"
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Опубликовать",
-                callback_data=f"publish:{item_id}",
-            ),
-            InlineKeyboardButton(
-                "⏭ Пропустить",
-                callback_data=f"skip:{item_id}",
-            ),
-        ]
-    ])
-
-    image_url = item["image_url"]
-    if image_url:
-        try:
-            await application.bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=image_url,
-                caption=message_text[:1024],
-                reply_markup=keyboard,
-            )
-        except Exception as photo_error:
-            print(f"⚠️ Фото не отправилось: {photo_error}")
-            await application.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=message_text[:4096],
-                reply_markup=keyboard,
-            )
-    else:
-        await application.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=message_text[:4096],
-            reply_markup=keyboard,
-        )
-
-    print(f"📩 Новость отправлена админу: {item['title']}")
-
-
-# ---------- Вспомогательная функция ----------
+# ---------- Отправка админу ----------
 
 async def find_and_send_next(application):
     candidate = await find_one_new_entry()
@@ -487,28 +463,63 @@ async def find_and_send_next(application):
         )
         return
 
-    # Помечаем как просмотренное в GitHub JSON
     mark_seen(candidate["item_key"])
-    await save_data(_data_cache)
+    await save_data()
 
-    # Отправляем админу напрямую (без SQLite)
-    await application.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"📬 Новость на проверку\n\n{post_text}\n\n"
-             f"Источник: {source_url or 'ссылка не указана'}",
-    )
+    review_id = str(uuid.uuid4())[:8]
 
-    # Сохраняем во временную переменную для кнопок
-    # (можно хранить в bot_data)
-    application.bot_data["last_candidate"] = {
+    pending_queue[review_id] = {
         "title": title,
         "post_text": post_text,
         "image_url": image_url,
         "source_url": source_url,
     }
 
+    message_text = (
+        f"📬 Новость на проверку\n\n"
+        f"{post_text}\n\n"
+        f"Источник: {source_url or 'ссылка не указана'}"
+    )
 
-# ---------- Проверка кнопок ----------
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Опубликовать",
+                callback_data=f"publish:{review_id}",
+            ),
+            InlineKeyboardButton(
+                "⏭ Пропустить",
+                callback_data=f"skip:{review_id}",
+            ),
+        ]
+    ])
+
+    if image_url:
+        try:
+            await application.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=image_url,
+                caption=message_text[:1024],
+                reply_markup=keyboard,
+            )
+        except Exception as photo_error:
+            print(f"⚠️ Фото не отправилось: {photo_error}")
+            await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=message_text[:4096],
+                reply_markup=keyboard,
+            )
+    else:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message_text[:4096],
+            reply_markup=keyboard,
+        )
+
+    print(f"📩 Новость отправлена админу: {title}")
+
+
+# ---------- Кнопки ----------
 
 async def review_callback(
     update: Update,
@@ -525,15 +536,20 @@ async def review_callback(
     await query.answer()
 
     try:
-        action, _ = query.data.split(":", 1)
+        action, review_id = query.data.split(":", 1)
     except (ValueError, AttributeError):
         return
 
-    candidate = context.bot_data.get("last_candidate")
+    item = pending_queue.get(review_id)
+
+    if not item:
+        await query.edit_message_text("Эта новость уже обработана.")
+        return
 
     if action == "skip":
+        del pending_queue[review_id]
         await query.edit_message_text("⏭ Пропущено.")
-        context.bot_data["last_candidate"] = None
+        print(f"⏭ Пропущено: {item['title']}")
         try:
             await find_and_send_next(context.application)
         except Exception as error:
@@ -541,13 +557,9 @@ async def review_callback(
         return
 
     if action == "publish":
-        if not candidate:
-            await query.edit_message_text("⚠️ Нет данных для публикации.")
-            return
-
         try:
-            post_text = candidate["post_text"]
-            image_url = candidate["image_url"]
+            post_text = item["post_text"]
+            image_url = item["image_url"]
 
             if image_url and len(post_text) <= 1024:
                 try:
@@ -567,15 +579,15 @@ async def review_callback(
                     text=post_text[:4096],
                 )
 
+            del pending_queue[review_id]
             await query.edit_message_text(
-                f"✅ Опубликовано: {candidate['title'][:60]}"
+                f"✅ Опубликовано: {item['title'][:60]}"
             )
-            print(f"✅ Опубликовано: {candidate['title']}")
-            context.bot_data["last_candidate"] = None
+            print(f"✅ Опубликовано: {item['title']}")
 
         except Exception as error:
             await query.edit_message_text(
-                "❌ Не удалось опубликовать. Смотри логи Render."
+                "❌ Не удалось опубликовать. Смотри логи."
             )
             print(f"❌ Ошибка публикации: {error}")
 
@@ -585,12 +597,15 @@ async def review_callback(
 async def news_scheduler(application: Application):
     while True:
         try:
+            if pending_queue:
+                await asyncio.sleep(60)
+                continue
+
             try:
                 await find_and_send_next(application)
             except Exception as error:
                 print(f"❌ Ошибка планировщика: {error}")
 
-            # Раз в 2 часа
             await asyncio.sleep(7200)
 
         except asyncio.CancelledError:
@@ -609,9 +624,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет доступа.")
         return
     await update.message.reply_text(
-        "Бот подключён. Новости приходят сюда.\n\n"
+        "Бот подключён.\n\n"
         "/now — прислать новость сейчас.\n"
-        "/reset — сбросить последнюю."
+        "/pending — показать очередь.\n"
+        "/reset — очистить очередь."
     )
 
 
@@ -621,6 +637,12 @@ async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
+    if pending_queue:
+        await update.message.reply_text(
+            "⚠️ Уже есть новость на проверке. Обработай её или /reset."
+        )
+        return
+
     await update.message.reply_text("🔍 Ищу свежую новость...")
     try:
         await find_and_send_next(context.application)
@@ -628,29 +650,57 @@ async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Ошибка в /now: {error}")
 
 
+async def show_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not pending_queue:
+        await update.message.reply_text("✅ Очередь пуста.")
+        return
+
+    text = f"📋 В очереди: {len(pending_queue)} новостей\n\n"
+    for rid, item in pending_queue.items():
+        text += f"• {rid}: {item['title'][:60]}\n"
+
+    await update.message.reply_text(text[:4096])
+
+
 async def reset_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
         return
     if update.effective_user.id != ADMIN_ID:
         return
-    context.bot_data["last_candidate"] = None
-    await update.message.reply_text("🗑 Сброшено. Нажми /now.")
+
+    count = len(pending_queue)
+    pending_queue.clear()
+    await update.message.reply_text(f"🗑 Очередь очищена ({count} шт.).")
 
 
 # ---------- Запуск ----------
 
 async def post_init(application: Application):
-    # Загружаем данные из GitHub при старте
     await load_data()
-    print(f"✅ Загружено {len(_data_cache.get('items', []))} просмотренных новостей")
+
+    if not isinstance(_data_cache, dict):
+        print("⚠️ _data_cache пуст, инициализирую")
+        globals()["_data_cache"] = dict(DEFAULT_DATA)
+
+    print(
+        f"✅ Загружено {len(_data_cache.get('items', []))} "
+        f"просмотренных новостей из GitHub"
+    )
 
     application.bot_data["scheduler_task"] = asyncio.create_task(
         news_scheduler(application)
     )
+
     await application.bot.set_my_commands([
         ("start", "Запустить бота"),
         ("now", "Прислать новость сейчас"),
-        ("reset", "Сбросить последнюю"),
+        ("pending", "Показать очередь"),
+        ("reset", "Очистить очередь"),
     ])
 
 
@@ -674,9 +724,13 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("now", force_fetch))
+    application.add_handler(CommandHandler("pending", show_pending))
     application.add_handler(CommandHandler("reset", reset_pending))
     application.add_handler(
-        CallbackQueryHandler(review_callback, pattern=r"^(publish|skip):\d+$")
+        CallbackQueryHandler(
+            review_callback,
+            pattern=r"^(publish|skip):[a-f0-9]+$",
+        )
     )
 
     application.run_polling()
