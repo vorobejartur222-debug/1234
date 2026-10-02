@@ -296,11 +296,15 @@ def rewrite_with_ai(title, summary):
 
     prompt = f"""Ты — автор позитивного молодёжного Telegram-канала.
 Напиши самостоятельный короткий пост на русском языке по заголовку и описанию.
-Пиши живо, неформально, с лёгким юмором и 2-3 подходящими эмодзи.
-Раскрой смысл новости, а не просто повтори заголовок.
-Не добавляй ссылки и не придумывай факты.
-Не более 3-4 предложений.
-ВАЖНО: длина итогового текста не должна превышать 800 символов.
+Пиши живо, неформально, с лёгким юмором.
+
+ПРАВИЛА ОФОРМЛЕНИЯ:
+- Начни пост с одного яркого эмодзи, который подходит по смыслу новости (например: 🚀, 🔥, 💡, 🎉, 🌟, 🤯, 😎, 💥, 🎮, 🎵, 🧠, 🌍, ✨).
+- Используй ещё 3-5 эмодзи по ходу текста, чтобы оживить его. Эмодзи должны подходить по смыслу, не ставь их наугад.
+- Не более 3-4 предложений.
+- Длина итогового текста — не более 800 символов.
+- Не добавляй ссылки и не придумывай факты.
+- Раскрой смысл новости, а не просто повтори заголовок.
 
 Заголовок: {title}
 Описание: {summary}
@@ -311,7 +315,7 @@ def rewrite_with_ai(title, summary):
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.8,
+            temperature=0.9,
             max_tokens=300,
         )
 
@@ -350,7 +354,7 @@ def make_post_text(title, summary):
 
     if summary:
         print(f"⚠️ Использую описание RSS вместо AI: {title}")
-        fallback = f"⚡ {title}\n\n{summary}"
+        fallback = f"🔥 {title}\n\n{summary} ✨"
         return fallback[:1000]
 
     return None
@@ -421,7 +425,7 @@ async def send_for_review(application, item):
         return
 
     message_text = (
-        f"📰 Новость на проверку\n\n"
+        f"📬 Новость на проверку\n\n"
         f"{item['post_text']}\n\n"
         f"Источник: {item['source_url'] or 'ссылка не указана'}"
     )
@@ -627,7 +631,7 @@ async def news_scheduler(application: Application):
                                     f"{type(error).__name__}: {error}"
                                 )
 
-            # ИЗМЕНЕНО: было 3600 (1 час), стало 7200 (2 часа)
+            # Раз в 2 часа
             await asyncio.sleep(7200)
 
         except asyncio.CancelledError:
@@ -663,7 +667,6 @@ async def start(
     )
 
 
-# НОВОЕ: команда /now
 async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/now — принудительно ищет и присылает новость."""
     if not update.effective_user or not update.message:
@@ -747,7 +750,6 @@ async def post_init(application: Application):
         news_scheduler(application)
     )
 
-    # НОВОЕ: регистрируем команды в меню Telegram
     await application.bot.set_my_commands([
         ("start", "Запустить бота"),
         ("now", "Прислать новость сейчас"),
@@ -779,7 +781,6 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start))
-    # НОВОЕ: регистрируем /now
     application.add_handler(CommandHandler("now", force_fetch))
     application.add_handler(
         CallbackQueryHandler(
