@@ -55,11 +55,13 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 # ---------- RSS-ленты ----------
 
 RSS_FEEDS = [
+    "https://nplus1.ru/rss",
+    "https://naked-science.ru/feed",
     "https://www.ixbt.com/export/news.rss",
     "https://tproger.ru/feed/",
     "https://the-flow.ru/rss/",
-    "https://ixbt.games/rss/",
     "https://www.sports.ru/rss/all.xml",
+    "https://kulturomania.ru/rss/",
 ]
 
 
@@ -101,6 +103,18 @@ def has_seen_item(item_key):
             (item_key,),
         ).fetchone()
         return row is not None
+
+
+def mark_as_seen(item_key, title):
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO news
+                (item_key, title, post_text, status)
+            VALUES (?, ?, '', 'skipped')
+            """,
+            (item_key, title),
+        )
 
 
 def create_pending_item(item_key, title, post_text, image_url, source_url):
@@ -253,6 +267,26 @@ def extract_image(entry, summary_html=""):
     return match.group(1) if match else None
 
 
+# ---------- Фильтр не-новостей ----------
+
+NON_NEWS_MARKERS = [
+    "туториал", "руководство", "как я ", "как сделать",
+    "мнение", "колонка", "перевод", "личный опыт",
+    "урок", "гайд", "how to", "tutorial", "заметки",
+    "мой проект", "я решил", "я сделал",
+]
+
+
+def is_news_item(title, summary):
+    text = f"{title} {summary}".lower()
+
+    for marker in NON_NEWS_MARKERS:
+        if marker in text:
+            return False
+
+    return True
+
+
 # ---------- AI-текст ----------
 
 def rewrite_with_ai(title, summary):
@@ -260,8 +294,6 @@ def rewrite_with_ai(title, summary):
         print("⚠️ GROQ_API_KEY не задан — AI недоступен")
         return None
 
-    # ИЗМЕНЕНО: добавили явное ограничение по длине,
-    # чтобы текст гарантированно влезал в подпись к фото (1024 символа).
     prompt = f"""Ты — автор позитивного молодёжного Telegram-канала.
 Напиши самостоятельный короткий пост на русском языке по заголовку и описанию.
 Пиши живо, неформально, с лёгким юмором и 2-3 подходящими эмодзи.
@@ -295,8 +327,6 @@ def rewrite_with_ai(title, summary):
 
         result = re.sub(r"https?://\S+", "", result.strip()).strip()
 
-        # ИЗМЕНЕНО: страховка — если AI всё равно переборщил с длиной,
-        # аккуратно обрезаем до 1000 символов.
         if len(result) > 1000:
             print(f"⚠️ AI вернул слишком длинный текст ({len(result)}), обрезаю")
             result = result[:997].rstrip() + "..."
@@ -321,23 +351,32 @@ def make_post_text(title, summary):
     if summary:
         print(f"⚠️ Использую описание RSS вместо AI: {title}")
         fallback = f"⚡ {title}\n\n{summary}"
-        # ИЗМЕНЕНО: тоже ограничиваем длину fallback-текста.
         return fallback[:1000]
-
 
     return None
 
 
 # ---------- Поиск одной новой записи ----------
 
-async def find_one_new_entry():
-    candidates = []
+_last_feed_index = 0
 
-    for feed_index, feed_url in enumerate(RSS_FEEDS):
+
+async def find_one_new_entry():
+    global _last_feed_index
+
+    total_feeds = len(RSS_FEEDS)
+    ordered_indices = [
+        (_last_feed_index + i) % total_feeds
+        for i in range(total_feeds)
+    ]
+
+    for feed_index in ordered_indices:
+        feed_url = RSS_FEEDS[feed_index]
+
         try:
             feed = await asyncio.to_thread(feedparser.parse, feed_url)
 
-            for entry_index, entry in enumerate(feed.entries):
+            for entry in feed.entries:
                 title = clean_html(
                     getattr(entry, "title", "") or ""
                 ) or "Без заголовка"
@@ -347,17 +386,22 @@ async def find_one_new_entry():
                 if has_seen_item(item_key):
                     continue
 
-                candidates.append({
+                summary = get_summary(entry)
+
+                if not is_news_item(title, summary):
+                    print(f"⏭ Пропускаю не-новость: {title[:80]}")
+                    mark_as_seen(item_key, title)
+                    continue
+
+                _last_feed_index = (feed_index + 1) % total_feeds
+                print(f"📡 Источник: {feed_url}")
+
+                return {
                     "entry": entry,
                     "title": title,
                     "feed_url": feed_url,
                     "item_key": item_key,
-                    "timestamp": get_timestamp(entry),
-                    "feed_index": feed_index,
-                    "entry_index": entry_index,
-                })
-
-                break
+                }
 
         except Exception as error:
             print(
@@ -365,17 +409,7 @@ async def find_one_new_entry():
                 f"{type(error).__name__}: {error}"
             )
 
-    if not candidates:
-        return None
-
-    return max(
-        candidates,
-        key=lambda item: (
-            item["timestamp"],
-            -item["feed_index"],
-            -item["entry_index"],
-        ),
-    )
+    return None
 
 
 # ---------- Отправка новости админу на проверку ----------
@@ -405,8 +439,6 @@ async def send_for_review(application, item):
         ]
     ])
 
-    # ИЗМЕНЕНО: если у новости есть картинка, отправляем превью с фото,
-    # чтобы админ видел, как пост будет выглядеть в канале.
     image_url = item["image_url"]
 
     if image_url:
@@ -422,7 +454,6 @@ async def send_for_review(application, item):
                 f"⚠️ Не удалось отправить превью с фото: "
                 f"{type(photo_error).__name__}: {photo_error}"
             )
-            # Фолбэк: отправляем просто текстом
             await application.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=message_text[:4096],
@@ -596,7 +627,8 @@ async def news_scheduler(application: Application):
                                     f"{type(error).__name__}: {error}"
                                 )
 
-            await asyncio.sleep(3600)
+            # ИЗМЕНЕНО: было 3600 (1 час), стало 7200 (2 часа)
+            await asyncio.sleep(7200)
 
         except asyncio.CancelledError:
             raise
@@ -625,8 +657,87 @@ async def start(
         return
 
     await update.message.reply_text(
-        "Бот подключён. Новости будут приходить сюда на проверку."
+        "Бот подключён. Новости будут приходить сюда на проверку.\n\n"
+        "Команды:\n"
+        "/now — прислать новость прямо сейчас, не дожидаясь таймера."
     )
+
+
+# НОВОЕ: команда /now
+async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/now — принудительно ищет и присылает новость."""
+    if not update.effective_user or not update.message:
+        return
+
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    pending = get_pending_item()
+    if pending:
+        await update.message.reply_text(
+            "⚠️ У тебя уже есть новость на проверке. "
+            "Сначала опубликуй или пропусти её."
+        )
+        return
+
+    await update.message.reply_text("🔍 Ищу свежую новость...")
+
+    try:
+        candidate = await find_one_new_entry()
+
+        if not candidate:
+            await update.message.reply_text(
+                "😔 Не нашёл новых подходящих новостей. "
+                "Попробуй позже."
+            )
+            return
+
+        entry = candidate["entry"]
+        title = candidate["title"]
+        summary = get_summary(entry)
+        source_url = getattr(entry, "link", "") or ""
+        raw_summary = getattr(entry, "summary", "") or ""
+        image_url = extract_image(entry, raw_summary)
+
+        post_text = await asyncio.to_thread(
+            make_post_text,
+            title,
+            summary,
+        )
+
+        if not post_text:
+            await update.message.reply_text(
+                "😔 Не удалось сгенерировать текст. Попробуй ещё раз."
+            )
+            return
+
+        item_id = create_pending_item(
+            item_key=candidate["item_key"],
+            title=title,
+            post_text=post_text,
+            image_url=image_url,
+            source_url=source_url,
+        )
+
+        if not item_id:
+            await update.message.reply_text(
+                "⚠️ Эта новость уже была в базе."
+            )
+            return
+
+        pending = get_pending_item()
+        if pending:
+            await send_for_review(context.application, pending)
+
+    except Exception as error:
+        print(
+            f"❌ Ошибка в /now: "
+            f"{type(error).__name__}: {error}"
+        )
+        await update.message.reply_text(
+            "❌ Что-то пошло не так. Смотри логи Render."
+        )
 
 
 # ---------- Запуск ----------
@@ -635,6 +746,12 @@ async def post_init(application: Application):
     application.bot_data["scheduler_task"] = asyncio.create_task(
         news_scheduler(application)
     )
+
+    # НОВОЕ: регистрируем команды в меню Telegram
+    await application.bot.set_my_commands([
+        ("start", "Запустить бота"),
+        ("now", "Прислать новость сейчас"),
+    ])
 
 
 async def post_shutdown(application: Application):
@@ -662,6 +779,8 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start))
+    # НОВОЕ: регистрируем /now
+    application.add_handler(CommandHandler("now", force_fetch))
     application.add_handler(
         CallbackQueryHandler(
             review_callback,
