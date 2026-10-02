@@ -90,6 +90,13 @@ def init_db():
         """)
 
         db.execute("""
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+        db.execute("""
             UPDATE news
             SET status = 'pending'
             WHERE status = 'publishing'
@@ -174,6 +181,27 @@ def item_is_pending(item_id):
             (item_id,),
         ).fetchone()
         return bool(row and row["status"] == "pending")
+
+
+def get_state(key, default=None):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT value FROM state WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else default
+
+
+def set_state(key, value):
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO state (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value)),
+        )
 
 
 # ---------- Flask для Render ----------
@@ -362,58 +390,62 @@ def make_post_text(title, summary):
 
 # ---------- Поиск одной новой записи ----------
 
-_last_feed_index = 0
+_find_lock = asyncio.Lock()
 
 
 async def find_one_new_entry():
-    global _last_feed_index
+    async with _find_lock:
+        last_index = int(get_state("last_feed_index", "0") or "0")
+        total_feeds = len(RSS_FEEDS)
 
-    total_feeds = len(RSS_FEEDS)
-    ordered_indices = [
-        (_last_feed_index + i) % total_feeds
-        for i in range(total_feeds)
-    ]
+        ordered_indices = [
+            (last_index + i) % total_feeds
+            for i in range(total_feeds)
+        ]
 
-    for feed_index in ordered_indices:
-        feed_url = RSS_FEEDS[feed_index]
+        for feed_index in ordered_indices:
+            feed_url = RSS_FEEDS[feed_index]
 
-        try:
-            feed = await asyncio.to_thread(feedparser.parse, feed_url)
+            try:
+                feed = await asyncio.to_thread(feedparser.parse, feed_url)
 
-            for entry in feed.entries:
-                title = clean_html(
-                    getattr(entry, "title", "") or ""
-                ) or "Без заголовка"
+                for entry in feed.entries:
+                    title = clean_html(
+                        getattr(entry, "title", "") or ""
+                    ) or "Без заголовка"
 
-                item_key = get_item_key(entry, feed_url, title)
+                    item_key = get_item_key(entry, feed_url, title)
 
-                if has_seen_item(item_key):
-                    continue
+                    if has_seen_item(item_key):
+                        continue
 
-                summary = get_summary(entry)
+                    summary = get_summary(entry)
 
-                if not is_news_item(title, summary):
-                    print(f"⏭ Пропускаю не-новость: {title[:80]}")
-                    mark_as_seen(item_key, title)
-                    continue
+                    if not is_news_item(title, summary):
+                        print(f"⏭ Пропускаю не-новость: {title[:80]}")
+                        mark_as_seen(item_key, title)
+                        continue
 
-                _last_feed_index = (feed_index + 1) % total_feeds
-                print(f"📡 Источник: {feed_url}")
+                    set_state(
+                        "last_feed_index",
+                        (feed_index + 1) % total_feeds,
+                    )
+                    print(f"📡 Источник: {feed_url}")
 
-                return {
-                    "entry": entry,
-                    "title": title,
-                    "feed_url": feed_url,
-                    "item_key": item_key,
-                }
+                    return {
+                        "entry": entry,
+                        "title": title,
+                        "feed_url": feed_url,
+                        "item_key": item_key,
+                    }
 
-        except Exception as error:
-            print(
-                f"❌ Ошибка чтения RSS {feed_url}: "
-                f"{type(error).__name__}: {error}"
-            )
+            except Exception as error:
+                print(
+                    f"❌ Ошибка чтения RSS {feed_url}: "
+                    f"{type(error).__name__}: {error}"
+                )
 
-    return None
+        return None
 
 
 # ---------- Отправка новости админу на проверку ----------
@@ -474,6 +506,59 @@ async def send_for_review(application, item):
     print(f"📩 Новость отправлена админу на проверку: {item['title']}")
 
 
+# ---------- Вспомогательная функция: найти и прислать следующую ----------
+
+async def find_and_send_next(application):
+    """Ищет одну новую запись и отправляет её админу."""
+    candidate = await find_one_new_entry()
+
+    if not candidate:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text="😔 Больше новых новостей нет. Пришлю, когда появятся.",
+        )
+        return
+
+    entry = candidate["entry"]
+    title = candidate["title"]
+    summary = get_summary(entry)
+    source_url = getattr(entry, "link", "") or ""
+    raw_summary = getattr(entry, "summary", "") or ""
+    image_url = extract_image(entry, raw_summary)
+
+    post_text = await asyncio.to_thread(
+        make_post_text,
+        title,
+        summary,
+    )
+
+    if not post_text:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text="😔 Не удалось сгенерировать текст. Нажми /now.",
+        )
+        return
+
+    new_item_id = create_pending_item(
+        item_key=candidate["item_key"],
+        title=title,
+        post_text=post_text,
+        image_url=image_url,
+        source_url=source_url,
+    )
+
+    if not new_item_id:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text="⚠️ Эта новость уже была в базе.",
+        )
+        return
+
+    pending = get_pending_item()
+    if pending:
+        await send_for_review(application, pending)
+
+
 # ---------- Проверка кнопок ----------
 
 async def review_callback(
@@ -517,6 +602,18 @@ async def review_callback(
             f"⏭ Новость пропущена.\n\n{item['title']}"
         )
         print(f"⏭ Администратор пропустил: {item['title']}")
+
+        try:
+            await find_and_send_next(context.application)
+        except Exception as error:
+            print(
+                f"❌ Ошибка при поиске следующей после skip: "
+                f"{type(error).__name__}: {error}"
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="❌ Не удалось найти следующую. Смотри логи Render.",
+            )
         return
 
     if action != "publish":
@@ -590,46 +687,13 @@ async def news_scheduler(application: Application):
                 await asyncio.sleep(60)
                 continue
 
-            candidate = await find_one_new_entry()
-
-            if candidate:
-                entry = candidate["entry"]
-                title = candidate["title"]
-                summary = get_summary(entry)
-                source_url = getattr(entry, "link", "") or ""
-                raw_summary = getattr(entry, "summary", "") or ""
-                image_url = extract_image(entry, raw_summary)
-
-                post_text = await asyncio.to_thread(
-                    make_post_text,
-                    title,
-                    summary,
+            try:
+                await find_and_send_next(application)
+            except Exception as error:
+                print(
+                    f"❌ Ошибка при поиске новости: "
+                    f"{type(error).__name__}: {error}"
                 )
-
-                if not post_text:
-                    print(
-                        f"⏭ Запись пропущена: нет описания "
-                        f"и AI не создал текст — {title}"
-                    )
-                else:
-                    item_id = create_pending_item(
-                        item_key=candidate["item_key"],
-                        title=title,
-                        post_text=post_text,
-                        image_url=image_url,
-                        source_url=source_url,
-                    )
-
-                    if item_id:
-                        pending = get_pending_item()
-                        if pending:
-                            try:
-                                await send_for_review(application, pending)
-                            except Exception as error:
-                                print(
-                                    f"❌ Не удалось отправить новость админу: "
-                                    f"{type(error).__name__}: {error}"
-                                )
 
             # Раз в 2 часа
             await asyncio.sleep(7200)
@@ -687,51 +751,7 @@ async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Ищу свежую новость...")
 
     try:
-        candidate = await find_one_new_entry()
-
-        if not candidate:
-            await update.message.reply_text(
-                "😔 Не нашёл новых подходящих новостей. "
-                "Попробуй позже."
-            )
-            return
-
-        entry = candidate["entry"]
-        title = candidate["title"]
-        summary = get_summary(entry)
-        source_url = getattr(entry, "link", "") or ""
-        raw_summary = getattr(entry, "summary", "") or ""
-        image_url = extract_image(entry, raw_summary)
-
-        post_text = await asyncio.to_thread(
-            make_post_text,
-            title,
-            summary,
-        )
-
-        if not post_text:
-            await update.message.reply_text(
-                "😔 Не удалось сгенерировать текст. Попробуй ещё раз."
-            )
-            return
-
-        item_id = create_pending_item(
-            item_key=candidate["item_key"],
-            title=title,
-            post_text=post_text,
-            image_url=image_url,
-            source_url=source_url,
-        )
-
-        if not item_id:
-            await update.message.reply_text(
-                "⚠️ Эта новость уже была в базе."
-            )
-            return
-
-        pending = get_pending_item()
-        if pending:
-            await send_for_review(context.application, pending)
+        await find_and_send_next(context.application)
 
     except Exception as error:
         print(
