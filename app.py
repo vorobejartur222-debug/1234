@@ -62,6 +62,10 @@ RSS_FEEDS = [
     "https://the-flow.ru/rss/",
     "https://www.sports.ru/rss/all.xml",
     "https://kulturomania.ru/rss/",
+    "https://hi-news.ru/feed/",        # НОВЫЙ
+    "https://russian.rt.com/rss/",      # НОВЫЙ
+    "https://lenta.ru/rss/",            # НОВЫЙ
+    "https://news.mail.ru/rss/", 
 ]
 
 
