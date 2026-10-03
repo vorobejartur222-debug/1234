@@ -89,7 +89,6 @@ _data_cache = dict(DEFAULT_DATA)
 _data_sha = None
 _data_lock = asyncio.Lock()
 
-# Очередь новостей, ожидающих проверки (в памяти)
 pending_queue = {}
 
 
@@ -435,6 +434,23 @@ async def find_one_new_entry():
         return None
 
 
+# ---------- Вспомогательная функция для кнопок ----------
+
+async def safe_edit(query, text):
+    """Пробует отредактировать и текст, и подпись — что сработает."""
+    try:
+        await query.edit_message_text(text)
+        return
+    except Exception:
+        pass
+
+    try:
+        await query.edit_message_caption(caption=text)
+        return
+    except Exception as error:
+        print(f"⚠️ Не удалось отредактировать сообщение: {error}")
+
+
 # ---------- Отправка админу ----------
 
 async def find_and_send_next(application):
@@ -543,12 +559,12 @@ async def review_callback(
     item = pending_queue.get(review_id)
 
     if not item:
-        await query.edit_message_text("Эта новость уже обработана.")
+        await safe_edit(query, "Эта новость уже обработана.")
         return
 
     if action == "skip":
         del pending_queue[review_id]
-        await query.edit_message_text("⏭ Пропущено.")
+        await safe_edit(query, "⏭ Пропущено.")
         print(f"⏭ Пропущено: {item['title']}")
         try:
             await find_and_send_next(context.application)
@@ -580,14 +596,16 @@ async def review_callback(
                 )
 
             del pending_queue[review_id]
-            await query.edit_message_text(
-                f"✅ Опубликовано: {item['title'][:60]}"
+            await safe_edit(
+                query,
+                f"✅ Опубликовано: {item['title'][:60]}",
             )
             print(f"✅ Опубликовано: {item['title']}")
 
         except Exception as error:
-            await query.edit_message_text(
-                "❌ Не удалось опубликовать. Смотри логи."
+            await safe_edit(
+                query,
+                "❌ Не удалось опубликовать. Смотри логи.",
             )
             print(f"❌ Ошибка публикации: {error}")
 
