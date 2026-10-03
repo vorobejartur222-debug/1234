@@ -564,12 +564,16 @@ async def review_callback(
 
     if action == "skip":
         del pending_queue[review_id]
-        await safe_edit(query, "⏭ Пропущено.")
+        await safe_edit(query, "⏭ Пропущено. Ищу следующую...")
         print(f"⏭ Пропущено: {item['title']}")
         try:
             await find_and_send_next(context.application)
         except Exception as error:
             print(f"❌ Ошибка после skip: {error}")
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="❌ Не удалось найти следующую. Смотри логи Render.",
+            )
         return
 
     if action == "publish":
@@ -656,16 +660,20 @@ async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if pending_queue:
+        pending_queue.clear()
         await update.message.reply_text(
-            "⚠️ Уже есть новость на проверке. Обработай её или /reset."
+            "🗑 Старая очередь очищена. Ищу новую..."
         )
-        return
+    else:
+        await update.message.reply_text("🔍 Ищу свежую новость...")
 
-    await update.message.reply_text("🔍 Ищу свежую новость...")
     try:
         await find_and_send_next(context.application)
     except Exception as error:
         print(f"❌ Ошибка в /now: {error}")
+        await update.message.reply_text(
+            "❌ Что-то пошло не так. Смотри логи Render."
+        )
 
 
 async def show_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
