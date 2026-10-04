@@ -83,12 +83,17 @@ GH_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-DEFAULT_DATA = {"items": [], "last_feed_index": 0}
+DEFAULT_DATA = {
+    "items": [],
+    "last_feed_index": 0,
+    "pending": {},
+}
 
 _data_cache = dict(DEFAULT_DATA)
 _data_sha = None
 _data_lock = asyncio.Lock()
 
+# pending_queue теперь синхронизирован с _data_cache["pending"]
 pending_queue = {}
 
 
@@ -97,7 +102,7 @@ def _gh_url(path=""):
 
 
 def _load_data_sync():
-    global _data_cache, _data_sha
+    global _data_cache, _data_sha, pending_queue
 
     try:
         response = requests.get(
@@ -110,6 +115,7 @@ def _load_data_sync():
             print("⚠️ seen_news.json не найден, начинаю с пустой базы")
             _data_cache = dict(DEFAULT_DATA)
             _data_sha = None
+            pending_queue = _data_cache["pending"]
             return _data_cache
 
         if response.status_code != 200:
@@ -119,6 +125,7 @@ def _load_data_sync():
             )
             _data_cache = dict(DEFAULT_DATA)
             _data_sha = None
+            pending_queue = _data_cache["pending"]
             return _data_cache
 
         payload = response.json()
@@ -130,15 +137,20 @@ def _load_data_sync():
 
         loaded.setdefault("items", [])
         loaded.setdefault("last_feed_index", 0)
+        loaded.setdefault("pending", {})
 
         _data_cache = loaded
         _data_sha = payload["sha"]
+        pending_queue = _data_cache["pending"]
+
+        print(f"💾 Загружено pending: {len(pending_queue)} записей")
         return _data_cache
 
     except Exception as error:
         print(f"❌ Ошибка загрузки данных из GitHub: {error}")
         _data_cache = dict(DEFAULT_DATA)
         _data_sha = None
+        pending_queue = _data_cache["pending"]
         return _data_cache
 
 
@@ -146,6 +158,16 @@ def _save_data_sync():
     global _data_sha
 
     try:
+        # Синхронизируем pending_queue → _data_cache["pending"]
+        _data_cache["pending"] = pending_queue
+
+        items_count = len(_data_cache.get("items", []))
+        pending_count = len(_data_cache.get("pending", {}))
+        print(
+            f"💾 _save_data_sync: сохраняю "
+            f"{items_count} items, {pending_count} pending"
+        )
+
         content = json.dumps(_data_cache, ensure_ascii=False, indent=2)
         encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
 
@@ -160,6 +182,9 @@ def _save_data_sync():
 
         if _data_sha:
             payload["sha"] = _data_sha
+            print(f"💾 _save_data_sync: sha = {_data_sha[:10]}...")
+        else:
+            print("💾 _save_data_sync: sha отсутствует (новый файл)")
 
         response = requests.put(
             _gh_url(GITHUB_DATA_FILE),
@@ -167,6 +192,8 @@ def _save_data_sync():
             json=payload,
             timeout=15,
         )
+
+        print(f"💾 _save_data_sync: ответ {response.status_code}")
 
         if response.status_code == 409:
             print("⚠️ Конфликт при сохранении, перечитываю...")
@@ -176,16 +203,17 @@ def _save_data_sync():
         if response.status_code not in (200, 201):
             print(
                 f"⚠️ Ошибка сохранения: {response.status_code} "
-                f"{response.text[:200]}"
+                f"{response.text[:300]}"
             )
             return False
 
         result = response.json()
         _data_sha = result["content"]["sha"]
+        print(f"✅ _save_data_sync: сохранено, новый sha = {_data_sha[:10]}...")
         return True
 
     except Exception as error:
-        print(f"❌ Ошибка сохранения данных: {error}")
+        print(f"❌ Ошибка сохранения данных: {type(error).__name__}: {error}")
         return False
 
 
@@ -484,7 +512,6 @@ async def find_and_send_next(application):
         return
 
     mark_seen(candidate["item_key"])
-    await save_data()
 
     review_id = str(uuid.uuid4())[:8]
 
@@ -494,6 +521,9 @@ async def find_and_send_next(application):
         "image_url": image_url,
         "source_url": source_url,
     }
+
+    # Сохраняем pending в GitHub сразу после добавления
+    await save_data()
 
     message_text = f"📬 Новость на проверку\n\n{post_text}"
 
@@ -564,6 +594,7 @@ async def review_callback(
 
     if action == "skip":
         del pending_queue[review_id]
+        await save_data()
         await safe_edit(query, "⏭ Пропущено. Ищу следующую...")
         print(f"⏭ Пропущено: {item['title']}")
         try:
@@ -600,6 +631,7 @@ async def review_callback(
                 )
 
             del pending_queue[review_id]
+            await save_data()
             await safe_edit(
                 query,
                 f"✅ Опубликовано: {item['title'][:60]}",
@@ -661,6 +693,7 @@ async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if pending_queue:
         pending_queue.clear()
+        await save_data()
         await update.message.reply_text(
             "🗑 Старая очередь очищена. Ищу новую..."
         )
@@ -701,6 +734,7 @@ async def reset_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     count = len(pending_queue)
     pending_queue.clear()
+    await save_data()
     await update.message.reply_text(f"🗑 Очередь очищена ({count} шт.).")
 
 
@@ -717,10 +751,12 @@ async def post_init(application: Application):
     if not isinstance(_data_cache, dict):
         print("⚠️ _data_cache пуст, инициализирую")
         globals()["_data_cache"] = dict(DEFAULT_DATA)
+        globals()["pending_queue"] = _data_cache["pending"]
 
     print(
         f"✅ Загружено {len(_data_cache.get('items', []))} "
-        f"просмотренных новостей из GitHub"
+        f"просмотренных новостей из GitHub, "
+        f"{len(pending_queue)} в очереди"
     )
 
     application.bot_data["scheduler_task"] = asyncio.create_task(
