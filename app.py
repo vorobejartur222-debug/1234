@@ -377,6 +377,7 @@ _find_lock = asyncio.Lock()
 
 
 async def find_one_new_entry():
+    print("🟠 find_one_new_entry: старт")
     global _data_cache
     if not isinstance(_data_cache, dict):
         _data_cache = dict(DEFAULT_DATA)
@@ -455,7 +456,9 @@ async def safe_edit(query, text):
 # ---------- Отправка админу ----------
 
 async def find_and_send_next(application):
+    print("🟡 find_and_send_next: старт")
     candidate = await find_one_new_entry()
+    print(f"🟡 find_and_send_next: candidate = {candidate is not None}")
 
     if not candidate:
         await application.bot.send_message(
@@ -704,7 +707,12 @@ async def reset_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Запуск ----------
 
 async def post_init(application: Application):
-    await load_data()
+    print("🔵 post_init: старт")
+    try:
+        await load_data()
+        print("🔵 post_init: load_data завершён")
+    except Exception as error:
+        print(f"❌ post_init: ошибка load_data: {type(error).__name__}: {error}")
 
     if not isinstance(_data_cache, dict):
         print("⚠️ _data_cache пуст, инициализирую")
@@ -718,6 +726,7 @@ async def post_init(application: Application):
     application.bot_data["scheduler_task"] = asyncio.create_task(
         news_scheduler(application)
     )
+    print("🟢 post_init: планировщик запущен")
 
     await application.bot.set_my_commands([
         ("start", "Запустить бота"),
@@ -725,6 +734,7 @@ async def post_init(application: Application):
         ("pending", "Показать очередь"),
         ("reset", "Очистить очередь"),
     ])
+    print("🟢 post_init: команды зарегистрированы")
 
 
 async def post_shutdown(application: Application):
