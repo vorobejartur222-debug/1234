@@ -20,11 +20,7 @@ import feedparser
 import requests
 from flask import Flask
 from groq import Groq
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -34,9 +30,9 @@ from telegram.ext import (
 from werkzeug.serving import make_server
 
 
-# =========================
+# ============================================================
 # Настройки и переменные окружения
-# =========================
+# ============================================================
 
 def required_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -60,11 +56,17 @@ TIMEZONE_NAME = os.environ.get("TIMEZONE", "UTC").strip()
 try:
     LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
 except ZoneInfoNotFoundError as exc:
-    raise RuntimeError(f"Неизвестная временная зона TIMEZONE={TIMEZONE_NAME}") from exc
+    raise RuntimeError(f"Неизвестная временная зона: {TIMEZONE_NAME}") from exc
 
 AUTO_PUBLISH_MINUTES = int(os.environ.get("AUTO_PUBLISH_MINUTES", "60"))
+
+# Проверка до шести RSS-лент одновременно.
+MAX_PARALLEL_FEEDS = 6
+FEED_CONNECT_TIMEOUT = 3
+FEED_READ_TIMEOUT = 6
+FEED_TOTAL_TIMEOUT = 9
+
 SCHEDULE_HOURS = {10, 14, 18, 22}
-FEED_TIMEOUT_SECONDS = 15
 
 if "/" not in GITHUB_REPO:
     raise RuntimeError("GITHUB_REPO должен иметь формат owner/repository")
@@ -72,24 +74,28 @@ if "/" not in GITHUB_REPO:
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-# =========================
-# Защита от повторного запуска в одном экземпляре
-# =========================
+# ============================================================
+# Защита от двойного запуска в одном контейнере
+# ============================================================
 
 LOCK_FILE = "/tmp/bot.lock"
 _LOCK_FD = None
 
 
 def acquire_lock():
-    """Не позволяет запустить два процесса в одном контейнере."""
+    """
+    Не позволяет запустить два процесса бота в одном контейнере.
+    Не защищает от другого сервиса Render или локального компьютера.
+    """
     global _LOCK_FD
 
     lock_fd = open(LOCK_FILE, "a+")
+
     try:
         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
         lock_fd.close()
-        print("⚠️ Другой процесс бота уже запущен в этом контейнере.")
+        print("⚠️ Бот уже запущен в этом контейнере.")
         sys.exit(1)
 
     lock_fd.seek(0)
@@ -97,13 +103,14 @@ def acquire_lock():
     lock_fd.write(str(os.getpid()))
     lock_fd.flush()
 
-    # Файл нельзя закрывать до остановки процесса: вместе с ним снимется lock.
+    # Нельзя закрывать файл, пока работает процесс:
+    # вместе с ним снимется файловая блокировка.
     _LOCK_FD = lock_fd
 
 
-# =========================
+# ============================================================
 # RSS-источники
-# =========================
+# ============================================================
 
 RSS_FEEDS = [
     "https://nplus1.ru/rss",
@@ -120,31 +127,24 @@ RSS_FEEDS = [
 ]
 
 
-# =========================
+# ============================================================
 # GitHub-хранилище
-# =========================
+# ============================================================
 
-DEFAULT_DATA = {
-    "items": [],
-    "pending": {},
-    "stats": {
-        "published": 0,
-        "skipped": 0,
-        "sources": {},
-    },
-    "last_schedule_slot": "",
-}
+def fresh_default_data():
+    return {
+        "items": [],
+        "pending": {},
+        "stats": {
+            "published": 0,
+            "skipped": 0,
+            "sources": {},
+        },
+        "last_schedule_slot": "",
+    }
 
-_data = {
-    "items": [],
-    "pending": {},
-    "stats": {
-        "published": 0,
-        "skipped": 0,
-        "sources": {},
-    },
-    "last_schedule_slot": "",
-}
+
+_data = fresh_default_data()
 _data_sha = None
 _data_lock = asyncio.Lock()
 pending_queue = _data["pending"]
@@ -163,20 +163,6 @@ GITHUB_CONTENTS_URL = (
 )
 
 
-def fresh_default_data():
-    """Новая копия структуры, чтобы не разделять вложенные словари."""
-    return {
-        "items": [],
-        "pending": {},
-        "stats": {
-            "published": 0,
-            "skipped": 0,
-            "sources": {},
-        },
-        "last_schedule_slot": "",
-    }
-
-
 def _load_sync():
     global _data, _data_sha, pending_queue
 
@@ -188,8 +174,8 @@ def _load_sync():
         )
 
         if response.status_code == 404:
-            # Файл ещё может не существовать: первый PUT создаст его.
-            print("ℹ️ Файл данных в GitHub пока не найден; будет создан при сохранении.")
+            # Файл ещё не создан. Первый успешный PUT создаст его.
+            print("ℹ️ Файл данных в GitHub не найден; создадим его при сохранении.")
             _data = fresh_default_data()
             _data_sha = None
 
@@ -209,11 +195,12 @@ def _load_sync():
             _data = fresh_default_data()
             _data.update(loaded)
 
-            # Защита от некорректной структуры файла.
             if not isinstance(_data.get("items"), list):
                 _data["items"] = []
+
             if not isinstance(_data.get("pending"), dict):
                 _data["pending"] = {}
+
             if not isinstance(_data.get("stats"), dict):
                 _data["stats"] = fresh_default_data()["stats"]
 
@@ -221,14 +208,19 @@ def _load_sync():
             _data["stats"].setdefault("skipped", 0)
             _data["stats"].setdefault("sources", {})
             _data.setdefault("last_schedule_slot", "")
-            _data_sha = payload["sha"]
+
+            _data_sha = payload.get("sha")
 
     except Exception as exc:
-        print(f"❌ Ошибка загрузки данных из GitHub: {type(exc).__name__}: {exc}")
+        print(
+            f"❌ Ошибка загрузки данных из GitHub: "
+            f"{type(exc).__name__}: {exc}"
+        )
         _data = fresh_default_data()
         _data_sha = None
 
     pending_queue = _data["pending"]
+
     print(
         f"💾 Загружено: {len(_data['items'])} items, "
         f"{len(pending_queue)} pending"
@@ -237,7 +229,6 @@ def _load_sync():
 
 
 def _save_sync():
-    """Сохраняет данные в GitHub Contents API."""
     global _data_sha
 
     _data["pending"] = pending_queue
@@ -249,8 +240,12 @@ def _save_sync():
                 ensure_ascii=False,
                 indent=2,
             )
+
             payload = {
-                "message": f"Update bot data {datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC",
+                "message": (
+                    "Update bot data "
+                    f"{datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC"
+                ),
                 "content": base64.b64encode(
                     content.encode("utf-8")
                 ).decode("ascii"),
@@ -276,15 +271,17 @@ def _save_sync():
                 return True
 
             if response.status_code == 409 and attempt < 2:
-                # SHA изменился. Получаем актуальную версию и повторяем запись.
+                # GitHub сообщает, что SHA устарел. Получаем актуальный.
                 current = requests.get(
                     GITHUB_CONTENTS_URL,
                     headers=GH_HEADERS,
                     timeout=15,
                 )
+
                 if current.status_code == 200:
                     _data_sha = current.json().get("sha")
                     continue
+
                 if current.status_code == 404:
                     _data_sha = None
                     continue
@@ -296,7 +293,10 @@ def _save_sync():
             return False
 
         except Exception as exc:
-            print(f"❌ Ошибка сохранения в GitHub: {type(exc).__name__}: {exc}")
+            print(
+                f"❌ Ошибка сохранения в GitHub: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return False
 
     return False
@@ -325,10 +325,11 @@ def is_seen(key: str) -> bool:
 
 def mark_seen(key: str):
     items = _data.setdefault("items", [])
+
     if key not in items:
         items.append(key)
 
-    # Не даём JSON-файлу бесконечно расти.
+    # Ограничиваем размер JSON-файла.
     if len(items) > 2000:
         _data["items"] = items[-2000:]
 
@@ -344,9 +345,9 @@ def bump_source(feed_url: str):
     sources[feed_url] = sources.get(feed_url, 0) + 1
 
 
-# =========================
+# ============================================================
 # Flask health-check
-# =========================
+# ============================================================
 
 flask_app = Flask(__name__)
 
@@ -357,9 +358,9 @@ def health():
     return "OK", 200
 
 
-# =========================
-# Очистка и обработка RSS
-# =========================
+# ============================================================
+# RSS: очистка, фильтр и поиск
+# ============================================================
 
 def clean_html(raw: str) -> str:
     if not raw:
@@ -416,15 +417,6 @@ BLOCK_MARKERS = [
     "как сделать",
     "how to",
     "tutorial",
-    "война",
-    "убит",
-    "погиб",
-    "теракт",
-    "катастрофа",
-    "трагедия",
-    "авария",
-    "смерть",
-    "умер",
 ]
 
 
@@ -434,26 +426,27 @@ def is_news_item(title: str, summary: str) -> bool:
 
 
 def parse_feed_sync(feed_url: str):
-    """Загружает RSS с тайм-аутом, затем передаёт содержимое feedparser."""
+    """Скачивает и разбирает одну RSS-ленту."""
     response = requests.get(
         feed_url,
         headers={"User-Agent": "VibeNewsBot/1.0"},
-        timeout=FEED_TIMEOUT_SECONDS,
+        timeout=(FEED_CONNECT_TIMEOUT, FEED_READ_TIMEOUT),
     )
     response.raise_for_status()
     return feedparser.parse(response.content)
 
 
-async def find_one_new_entry():
-    feeds = list(RSS_FEEDS)
-    random.shuffle(feeds)
-
-    for feed_url in feeds:
+async def fetch_fresh_from_feed(
+    feed_url: str,
+    semaphore: asyncio.Semaphore,
+):
+    """Проверяет одну ленту и возвращает новые подходящие записи."""
+    async with semaphore:
         try:
-            feed = await asyncio.to_thread(parse_feed_sync, feed_url)
-
-            if not feed.entries:
-                continue
+            feed = await asyncio.wait_for(
+                asyncio.to_thread(parse_feed_sync, feed_url),
+                timeout=FEED_TOTAL_TIMEOUT,
+            )
 
             fresh = []
 
@@ -480,58 +473,120 @@ async def find_one_new_entry():
                     "key": key,
                 })
 
-            if fresh:
-                return random.choice(fresh)
+            return fresh
+
+        except asyncio.TimeoutError:
+            print(f"⏱️ Тайм-аут RSS: {feed_url}")
 
         except Exception as exc:
             print(
-                f"❌ RSS {feed_url}: "
+                f"⚠️ Ошибка RSS {feed_url}: "
                 f"{type(exc).__name__}: {exc}"
             )
 
-    return None
+        return []
 
 
-# =========================
-# Groq: генерация поста
-# =========================
+async def find_one_new_entry():
+    """
+    Проверяет RSS параллельно и отдаёт первую найденную новость.
+    Медленные ленты не блокируют весь поиск.
+    """
+    feeds = list(RSS_FEEDS)
+    random.shuffle(feeds)
+
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_FEEDS)
+
+    tasks = {
+        asyncio.create_task(fetch_fresh_from_feed(url, semaphore))
+        for url in feeds
+    }
+
+    try:
+        while tasks:
+            done, tasks = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in done:
+                try:
+                    fresh = task.result()
+                except Exception as exc:
+                    print(
+                        f"⚠️ Ошибка задачи RSS: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+
+                if fresh:
+                    for pending_task in tasks:
+                        pending_task.cancel()
+
+                    return random.choice(fresh)
+
+        return None
+
+    finally:
+        for task in tasks:
+            task.cancel()
+
+
+# ============================================================
+# Groq: создание текста поста
+# ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
     if not groq_client:
-        print("⚠️ GROQ_API_KEY не задан, генерация поста недоступна.")
+        print("⚠️ GROQ_API_KEY не задан.")
         return None
 
-    prompt = f"""Ты — автор позитивного молодёжного Telegram-канала +VIBE NEWS.
-Напиши короткий пост на русском по заголовку и описанию.
-Пиши живо, неформально, с лёгким юмором.
+    prompt = prompt = f"""Ты — редактор молодёжного Telegram-канала +VIBE NEWS.
+Подготовь короткий, понятный и содержательный пост на русском языке
+по заголовку и описанию источника.
 
 СТИЛЬ:
-- Сленг уместен: «вайб», «топчик».
-- Задай вопрос подписчикам в конце, если уместно.
+- Пиши естественно и уважительно, без искусственного хайпа.
+- Тон дружелюбный, но чуть более серьёзный и информативный.
+- Не используй сленг, если он не нужен для смысла.
+- Объясни, что произошло и почему это может быть интересно читателю.
+- Не добавляй вступления вроде «Стало известно» или «В сети обсуждают».
 
-ПРАВИЛА:
-- Начни с подходящего эмодзи.
-- Используй несколько эмодзи, но не перегружай текст.
-- 3–4 предложения, до 800 символов.
-- Не добавляй ссылки и не выдумывай факты.
+ФАКТИЧНОСТЬ:
+- Используй только факты из заголовка и описания.
+- Не придумывай цифры, причины, последствия, цитаты и детали.
+- Если информации недостаточно, сформулируй текст осторожно и не додумывай.
+- Сохрани важные оговорки и неопределённость оригинала.
+- Не выдавай мнение за факт.
 
-Заголовок: {title}
-Описание: {summary}
+ФОРМАТ:
+- 2–4 коротких предложения.
+- До 700 символов.
+- Один уместный эмодзи в начале; остальные — только если действительно подходят.
+- Не добавляй ссылки и хэштеги.
+- В конце можно задать короткий вопрос по теме, если это звучит естественно.
 
-Текст поста:"""
+Заголовок:
+{title}
+
+Описание:
+{summary}
+
+Готовый пост:"""
 
     try:
-        result = groq_client.chat.completions.create(
+        response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.8,
+            temperature=0.5,
             max_tokens=300,
         )
 
-        if not result.choices:
+        if not response.choices:
             return None
 
-        text = result.choices[0].message.content
+        text = response.choices[0].message.content
+
         if not text:
             return None
 
@@ -551,9 +606,9 @@ def rewrite_with_ai(title: str, summary: str):
         return None
 
 
-# =========================
-# Telegram: сообщения и кнопки
-# =========================
+# ============================================================
+# Telegram: клавиатура и отправка
+# ============================================================
 
 def build_keyboard(review_id: str):
     return InlineKeyboardMarkup([[
@@ -575,10 +630,13 @@ async def safe_edit(query, text: str):
         try:
             await query.edit_message_caption(caption=text)
         except Exception as exc:
-            print(f"⚠️ Не удалось обновить сообщение: {exc}")
+            print(f"⚠️ Не удалось обновить Telegram-сообщение: {exc}")
 
 
-async def find_and_send_next(app: Application, max_attempts: int = 6):
+async def find_and_send_next(
+    app: Application,
+    max_attempts: int = 6,
+):
     for _ in range(max_attempts):
         candidate = await find_one_new_entry()
 
@@ -597,6 +655,7 @@ async def find_and_send_next(app: Application, max_attempts: int = 6):
         raw_summary = getattr(entry, "summary", "") or ""
         image_url = extract_image(entry, raw_summary)
 
+        # Groq — синхронный запрос, поэтому выполняем его в отдельном потоке.
         post_text = await asyncio.to_thread(
             rewrite_with_ai,
             title,
@@ -604,7 +663,7 @@ async def find_and_send_next(app: Application, max_attempts: int = 6):
         )
 
         if not post_text:
-            print(f"⏭️ AI не подготовил пост: {title[:80]}")
+            print(f"⏭️ Не удалось подготовить пост: {title[:80]}")
             mark_seen(candidate["key"])
             bump_stat("skipped")
             await save_data()
@@ -641,6 +700,7 @@ async def find_and_send_next(app: Application, max_attempts: int = 6):
                     text=message_text[:4096],
                     reply_markup=keyboard,
                 )
+
         except Exception as exc:
             print(f"⚠️ Не удалось отправить фото, отправляю текст: {exc}")
             await app.bot.send_message(
@@ -671,7 +731,7 @@ async def publish_to_channel(app: Application, item: dict):
                 caption=post_text,
             )
         except Exception as exc:
-            print(f"⚠️ Фото не отправлено, публикую текст: {exc}")
+            print(f"⚠️ Не удалось отправить фото, публикую текст: {exc}")
             message = await app.bot.send_message(
                 chat_id=CHANNEL_ID,
                 text=post_text[:4096],
@@ -689,29 +749,35 @@ async def publish_to_channel(app: Application, item: dict):
             reaction=["🔥", "❤️", "😎"],
         )
     except Exception:
-        # Реакции могут быть недоступны для канала или конкретного сообщения.
+        # Реакции могут быть недоступны для канала.
         pass
 
     return message
 
 
-# =========================
-# Команды и модерация
-# =========================
+# ============================================================
+# Команды администратора
+# ============================================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
 
     await update.effective_message.reply_text(
-        "Привет! Я готовлю новости для проверки.\n\n"
+        "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
         "/stats — статистика\n"
-        "/help — список команд"
+        "/help — помощь"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
 
@@ -719,11 +785,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/next — найти следующую публикацию\n"
         "/stats — показать статистику\n"
         "/help — помощь\n\n"
-        "Посты можно опубликовать или пропустить кнопками под сообщением."
+        "Публикуйте или пропускайте пост кнопками под сообщением."
     )
 
 
-async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def next_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
 
@@ -731,7 +800,10 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await find_and_send_next(context.application)
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
 
@@ -759,7 +831,10 @@ async def review_callback(
         return
 
     if not query.from_user or query.from_user.id != ADMIN_ID:
-        await query.answer("Эта кнопка доступна только администратору.", show_alert=True)
+        await query.answer(
+            "Эта кнопка доступна только администратору.",
+            show_alert=True,
+        )
         return
 
     await query.answer()
@@ -780,6 +855,7 @@ async def review_callback(
         pending_queue.pop(review_id, None)
         bump_stat("skipped")
         await save_data()
+
         await safe_edit(query, "⏭️ Пропущено. Ищу следующий материал...")
         await find_and_send_next(context.application)
         return
@@ -790,9 +866,11 @@ async def review_callback(
 
     try:
         await publish_to_channel(context.application, item)
+
         pending_queue.pop(review_id, None)
         bump_stat("published")
         await save_data()
+
         await safe_edit(query, f"✅ Опубликовано: {item['title'][:60]}")
         print(f"✅ Опубликовано: {item['title']}")
 
@@ -801,12 +879,12 @@ async def review_callback(
         print(f"❌ Ошибка публикации: {type(exc).__name__}: {exc}")
 
 
-# =========================
+# ============================================================
 # Фоновые задачи
-# =========================
+# ============================================================
 
 async def auto_publish_loop(app: Application):
-    """Автоматически публикует посты, ожидающие решения дольше заданного срока."""
+    """Публикует посты, которые ждут решения дольше заданного времени."""
     while True:
         try:
             now = time.time()
@@ -819,13 +897,17 @@ async def auto_publish_loop(app: Application):
 
                 try:
                     await publish_to_channel(app, item)
+
                     pending_queue.pop(review_id, None)
                     bump_stat("published")
                     await save_data()
 
                     await app.bot.send_message(
                         chat_id=ADMIN_ID,
-                        text=f"⏰ Автопубликация выполнена: {item.get('title', '')[:100]}",
+                        text=(
+                            "⏰ Автопубликация выполнена: "
+                            f"{item.get('title', '')[:100]}"
+                        ),
                     )
                     print(f"⏰ Автопубликация: {item.get('title', '')}")
 
@@ -845,7 +927,7 @@ async def auto_publish_loop(app: Application):
 
 
 async def schedule_loop(app: Application):
-    """Ищет один новый материал в заданные часы по TIMEZONE."""
+    """Плановый поиск в заданные часы в выбранной временной зоне."""
     while True:
         try:
             now = datetime.now(LOCAL_TZ)
@@ -854,7 +936,7 @@ async def schedule_loop(app: Application):
                 slot = now.strftime("%Y-%m-%d-%H")
 
                 if _data.get("last_schedule_slot") != slot:
-                    # Сохраняем слот до поиска, чтобы не повторять его каждые 30 секунд.
+                    # Запоминаем слот, чтобы не запускать поиск каждые 30 секунд.
                     _data["last_schedule_slot"] = slot
                     await save_data()
 
@@ -870,9 +952,9 @@ async def schedule_loop(app: Application):
         await asyncio.sleep(30)
 
 
-# =========================
-# Запуск приложения
-# =========================
+# ============================================================
+# Запуск и корректная остановка
+# ============================================================
 
 async def main():
     acquire_lock()
@@ -891,6 +973,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(review_callback))
 
     port = int(os.environ.get("PORT", "10000"))
+
     http_server = make_server(
         "0.0.0.0",
         port,
@@ -904,15 +987,17 @@ async def main():
     )
     http_thread.start()
 
-    stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
-            # Запасной вариант для окружений без add_signal_handler.
-            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop_event.set))
+            signal.signal(
+                sig,
+                lambda *_: loop.call_soon_threadsafe(stop_event.set),
+            )
 
     background_tasks = []
 
@@ -923,6 +1008,7 @@ async def main():
         if application.updater is None:
             raise RuntimeError("У Telegram Application отсутствует Updater")
 
+        # Важно: polling должен работать только в одном экземпляре приложения.
         await application.updater.start_polling()
 
         background_tasks = [
