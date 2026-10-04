@@ -35,7 +35,6 @@ LOCK_FILE = "/tmp/bot.lock"
 
 
 def acquire_lock():
-    """Пытается захватить файловую блокировку. Если не удалось — выходит."""
     try:
         lock_fd = open(LOCK_FILE, "w")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -127,7 +126,7 @@ def _load_data_sync():
         response = requests.get(
             _gh_url(GITHUB_DATA_FILE),
             headers=GH_HEADERS,
-            timeout=15,
+            timeout=10,
         )
 
         if response.status_code == 404:
@@ -173,8 +172,12 @@ def _load_data_sync():
         return _data_cache
 
 
-def _save_data_sync():
+def _save_data_sync(attempt=1):
     global _data_sha
+
+    if attempt > 3:
+        print("⚠️ save_data: превышено число попыток, пропускаю")
+        return False
 
     try:
         _data_cache["pending"] = pending_queue
@@ -182,7 +185,7 @@ def _save_data_sync():
         items_count = len(_data_cache.get("items", []))
         pending_count = len(_data_cache.get("pending", {}))
         print(
-            f"💾 _save_data_sync: сохраняю "
+            f"💾 _save_data_sync: попытка {attempt}, "
             f"{items_count} items, {pending_count} pending"
         )
 
@@ -205,15 +208,15 @@ def _save_data_sync():
             _gh_url(GITHUB_DATA_FILE),
             headers=GH_HEADERS,
             json=payload,
-            timeout=15,
+            timeout=10,
         )
 
         print(f"💾 _save_data_sync: ответ {response.status_code}")
 
         if response.status_code == 409:
-            print("⚠️ Конфликт при сохранении, перечитываю...")
+            print("⚠️ Конфликт SHA, перечитываю...")
             _load_data_sync()
-            return _save_data_sync()
+            return _save_data_sync(attempt + 1)
 
         if response.status_code not in (200, 201):
             print(
@@ -238,8 +241,15 @@ async def load_data():
 
 
 async def save_data():
-    async with _data_lock:
-        return await asyncio.to_thread(_save_data_sync)
+    try:
+        async with _data_lock:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_save_data_sync),
+                timeout=30,
+            )
+    except asyncio.TimeoutError:
+        print("⚠️ save_data: таймаут 30 секунд, пропускаю")
+        return False
 
 
 def is_seen(item_key):
@@ -466,7 +476,6 @@ async def find_one_new_entry():
 
                 chosen = random.choice(fresh_entries)
                 set_last_feed_index((feed_index + 1) % total_feeds)
-                await save_data()
                 print(f"📡 Источник: {feed_url}")
                 return chosen
 
@@ -536,6 +545,7 @@ async def find_and_send_next(application):
         "source_url": source_url,
     }
 
+    # Сохраняем только здесь — после успешного добавления
     await save_data()
 
     message_text = f"📬 Новость на проверку\n\n{post_text}"
@@ -818,7 +828,7 @@ def main():
         )
     )
 
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
