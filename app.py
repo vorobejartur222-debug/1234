@@ -9,6 +9,8 @@ import threading
 import hashlib
 import time
 import uuid
+import sys
+import fcntl
 
 import requests
 import feedparser
@@ -25,6 +27,24 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+
+
+# ---------- Защита от двойного запуска ----------
+
+LOCK_FILE = "/tmp/bot.lock"
+
+
+def acquire_lock():
+    """Пытается захватить файловую блокировку. Если не удалось — выходит."""
+    try:
+        lock_fd = open(LOCK_FILE, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        return lock_fd
+    except (IOError, OSError):
+        print("⚠️ Другой экземпляр бота уже запущен. Выхожу.")
+        sys.exit(0)
 
 
 # ---------- Настройки ----------
@@ -93,7 +113,6 @@ _data_cache = dict(DEFAULT_DATA)
 _data_sha = None
 _data_lock = asyncio.Lock()
 
-# pending_queue теперь синхронизирован с _data_cache["pending"]
 pending_queue = {}
 
 
@@ -158,7 +177,6 @@ def _save_data_sync():
     global _data_sha
 
     try:
-        # Синхронизируем pending_queue → _data_cache["pending"]
         _data_cache["pending"] = pending_queue
 
         items_count = len(_data_cache.get("items", []))
@@ -182,9 +200,6 @@ def _save_data_sync():
 
         if _data_sha:
             payload["sha"] = _data_sha
-            print(f"💾 _save_data_sync: sha = {_data_sha[:10]}...")
-        else:
-            print("💾 _save_data_sync: sha отсутствует (новый файл)")
 
         response = requests.put(
             _gh_url(GITHUB_DATA_FILE),
@@ -209,7 +224,7 @@ def _save_data_sync():
 
         result = response.json()
         _data_sha = result["content"]["sha"]
-        print(f"✅ _save_data_sync: сохранено, новый sha = {_data_sha[:10]}...")
+        print(f"✅ _save_data_sync: сохранено")
         return True
 
     except Exception as error:
@@ -467,7 +482,6 @@ async def find_one_new_entry():
 # ---------- Вспомогательная функция для кнопок ----------
 
 async def safe_edit(query, text):
-    """Пробует отредактировать и текст, и подпись — что сработает."""
     try:
         await query.edit_message_text(text)
         return
@@ -522,7 +536,6 @@ async def find_and_send_next(application):
         "source_url": source_url,
     }
 
-    # Сохраняем pending в GitHub сразу после добавления
     await save_data()
 
     message_text = f"📬 Новость на проверку\n\n{post_text}"
@@ -781,6 +794,9 @@ async def post_shutdown(application: Application):
 
 
 def main():
+    lock_fd = acquire_lock()
+    print(f"🔒 Блокировка захвачена, PID = {os.getpid()}")
+
     threading.Thread(target=run_flask, daemon=True).start()
 
     application = (
