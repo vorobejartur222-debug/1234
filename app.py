@@ -11,7 +11,7 @@ import time
 import uuid
 import sys
 import fcntl
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import requests
 import feedparser
@@ -55,9 +55,7 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json")
 
-# Авто-публикация через час, если админ не нажал кнопку
 AUTO_PUBLISH_MINUTES = 60
-# Автопостинг в пиковые часы
 SCHEDULE_HOURS = [10, 14, 18, 22]
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -258,11 +256,11 @@ def extract_image(entry, raw_summary=""):
 
 
 # ---------- Жёсткий фильтр ----------
+# Только жёсткий негатив и блогерские посты.
 
 BLOCK_MARKERS = [
     "туториал", "руководство", "как я ", "как сделать",
-    "мнение", "колонка", "перевод", "личный опыт",
-    "урок", "гайд", "how to", "tutorial",
+    "how to", "tutorial",
     "война", "убит", "погиб", "теракт", "катастрофа",
     "трагедия", "авария", "смерть", "умер",
 ]
@@ -274,35 +272,6 @@ def is_news_item(title, summary):
 
 
 # ---------- AI ----------
-
-def ai_is_positive(title, summary):
-    """AI-фильтр: позитивная ли новость."""
-    if not groq_client:
-        return True
-
-    prompt = f"""Оцени новость. Она позитивная, нейтральная или негативная?
-Ответь ОДНИМ словом: ПОЗИТИВ, НЕЙТРАЛ или НЕГАТИВ.
-Если новость про политику, войну, кризис — НЕГАТИВ.
-
-Заголовок: {title}
-Описание: {summary[:400]}
-
-Ответ:"""
-
-    try:
-        r = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=10,
-        )
-        if not r.choices:
-            return True
-        verdict = r.choices[0].message.content.strip().upper()
-        return "НЕГАТИВ" not in verdict
-    except Exception:
-        return True
-
 
 def rewrite_with_ai(title, summary):
     if not groq_client:
@@ -438,17 +407,10 @@ async def find_and_send_next(app, depth=0):
     raw_summary = getattr(entry, "summary", "") or ""
     image_url = extract_image(entry, raw_summary)
 
-    # AI-фильтр негатива
-    if not await asyncio.to_thread(ai_is_positive, title, summary):
-        print(f"⏭ AI: негатив — {title[:60]}")
-        mark_seen(candidate["key"])
-        bump_stat("skipped")
-        await save_data()
-        return await find_and_send_next(app, depth + 1)
-
     post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
     if not post_text:
+        print(f"⏭ AI не справился: {title[:60]}")
         mark_seen(candidate["key"])
         bump_stat("skipped")
         await save_data()
@@ -513,7 +475,6 @@ async def publish_to_channel(app, item):
     else:
         msg = await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
 
-    # Реакции на пост
     try:
         await app.bot.set_message_reaction(
             chat_id=CHANNEL_ID,
@@ -659,8 +620,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/now — прислать новость\n"
         "/pending — очередь\n"
         "/reset — очистить\n"
-        "/stats — статистика\n"
-        "/edit — редактировать последнюю"
+        "/stats — статистика"
     )
 
 
@@ -727,39 +687,6 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text[:4096])
 
 
-async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not pending_queue:
-        await update.message.reply_text("Нет новостей в очереди.")
-        return
-
-    rid, item = list(pending_queue.items())[-1]
-    ctx.user_data["editing"] = rid
-    await update.message.reply_text(
-        f"✏️ Отправь новый текст для поста:\n\n{item['post_text']}"
-    )
-
-
-async def handle_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    rid = ctx.user_data.pop("editing", None)
-    if not rid or rid not in pending_queue:
-        return
-
-    new_text = update.message.text
-    if not new_text:
-        return
-
-    pending_queue[rid]["post_text"] = new_text
-    await save_data()
-    await update.message.reply_text("✅ Текст обновлён.")
-    await find_and_send_next(ctx.application)
-
-
 # ---------- Запуск ----------
 
 async def post_init(app: Application):
@@ -773,7 +700,6 @@ async def post_init(app: Application):
         ("pending", "Очередь"),
         ("reset", "Очистить"),
         ("stats", "Статистика"),
-        ("edit", "Редактировать"),
     ])
     print("✅ Бот готов")
 
@@ -808,9 +734,7 @@ def main():
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^(publish|skip):[a-f0-9]+$"))
-    app.add_handler(CommandHandler("start", handle_edit), group=1)
 
     app.run_polling(drop_pending_updates=True)
 
