@@ -11,6 +11,7 @@ import time
 import uuid
 import sys
 import fcntl
+import subprocess
 from datetime import datetime
 
 import requests
@@ -52,7 +53,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-GITHUB_REPO = os.environ["GITHUB_REPO"]
+GITHUB_REPO = os.environ["GITHUB_REPO"].strip()
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json")
 
 AUTO_PUBLISH_MINUTES = 60
@@ -108,7 +109,7 @@ def _load_sync():
     try:
         r = requests.get(_gh_url(), headers=GH_HEADERS, timeout=10)
         if r.status_code != 200:
-            print(f"⚠️ GitHub GET {r.status_code}")
+            print(f"⚠️ GitHub GET {r.status_code}: {r.text[:200]}")
             _data = dict(DEFAULT_DATA)
             _data_sha = None
         else:
@@ -256,7 +257,6 @@ def extract_image(entry, raw_summary=""):
 
 
 # ---------- Жёсткий фильтр ----------
-# Только жёсткий негатив и блогерские посты.
 
 BLOCK_MARKERS = [
     "туториал", "руководство", "как я ", "как сделать",
@@ -716,6 +716,24 @@ async def post_shutdown(app: Application):
 
 
 def main():
+    # 🔍 Проверяем, сколько процессов python app.py запущено
+    try:
+        result = subprocess.run(
+            ["ps", "-ef"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        python_procs = [
+            line for line in result.stdout.split("\n")
+            if "python" in line and "app.py" in line
+        ]
+        print(f"🔍 Процессов python app.py: {len(python_procs)}")
+        for p in python_procs:
+            print(f"   {p}")
+    except Exception as e:
+        print(f"⚠️ ps failed: {e}")
+
     acquire_lock()
     print(f"🔒 PID = {os.getpid()}")
 
