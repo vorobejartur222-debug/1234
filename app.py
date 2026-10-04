@@ -50,7 +50,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ["GITHUB_REPO"].strip()
@@ -716,7 +716,6 @@ async def post_shutdown(app: Application):
 
 
 def main():
-    # 🔍 Проверяем, сколько процессов python app.py запущено
     try:
         result = subprocess.run(
             ["ps", "-ef"],
@@ -754,7 +753,13 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^(publish|skip):[a-f0-9]+$"))
 
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
 
 
 if __name__ == "__main__":
