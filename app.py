@@ -16,11 +16,7 @@ import requests
 import feedparser
 from flask import Flask
 from groq import Groq
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -42,37 +38,21 @@ def acquire_lock():
         lock_fd.flush()
         return lock_fd
     except (IOError, OSError):
-        print("⚠️ Другой экземпляр бота уже запущен. Выхожу.")
+        print("⚠️ Другой экземпляр уже запущен. Выхожу.")
         sys.exit(0)
 
 
 # ---------- Настройки ----------
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
-ADMIN_ID_RAW = os.environ.get("ADMIN_ID")
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHANNEL_ID = os.environ["CHANNEL_ID"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPO = os.environ["GITHUB_REPO"]
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("В Render не задана переменная TELEGRAM_TOKEN")
-if not CHANNEL_ID:
-    raise RuntimeError("В Render не задана переменная CHANNEL_ID")
-if not ADMIN_ID_RAW:
-    raise RuntimeError("В Render не задана переменная ADMIN_ID")
-if not GITHUB_TOKEN:
-    raise RuntimeError("В Render не задана переменная GITHUB_TOKEN")
-if not GITHUB_REPO:
-    raise RuntimeError("В Render не задана переменная GITHUB_REPO")
-
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
-except ValueError:
-    raise RuntimeError("ADMIN_ID должен быть числовым Telegram ID")
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
@@ -88,9 +68,6 @@ RSS_FEEDS = [
     "https://www.sports.ru/rss/all.xml",
     "https://kulturomania.ru/rss/",
     "https://hi-news.ru/feed/",
-    "https://russian.rt.com/rss/",
-    "https://lenta.ru/rss/",
-    "https://news.mail.ru/rss/",
 ]
 
 
@@ -102,182 +79,104 @@ GH_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-DEFAULT_DATA = {
-    "items": [],
-    "last_feed_index": 0,
-    "pending": {},
-}
+DEFAULT_DATA = {"items": [], "pending": {}}
 
-_data_cache = dict(DEFAULT_DATA)
+_data = dict(DEFAULT_DATA)
 _data_sha = None
 _data_lock = asyncio.Lock()
-
-pending_queue = {}
-
-
-def _gh_url(path=""):
-    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+pending_queue = _data["pending"]
 
 
-def _load_data_sync():
-    global _data_cache, _data_sha, pending_queue
+def _gh_url():
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DATA_FILE}"
 
+
+def _load_sync():
+    global _data, _data_sha, pending_queue
     try:
-        response = requests.get(
-            _gh_url(GITHUB_DATA_FILE),
-            headers=GH_HEADERS,
-            timeout=10,
-        )
-
-        if response.status_code == 404:
-            print("⚠️ seen_news.json не найден, начинаю с пустой базы")
-            _data_cache = dict(DEFAULT_DATA)
+        r = requests.get(_gh_url(), headers=GH_HEADERS, timeout=10)
+        if r.status_code != 200:
+            print(f"⚠️ GitHub GET {r.status_code}")
+            _data = dict(DEFAULT_DATA)
             _data_sha = None
-            pending_queue = _data_cache["pending"]
-            return _data_cache
-
-        if response.status_code != 200:
-            print(
-                f"⚠️ GitHub вернул {response.status_code}: "
-                f"{response.text[:200]}"
-            )
-            _data_cache = dict(DEFAULT_DATA)
-            _data_sha = None
-            pending_queue = _data_cache["pending"]
-            return _data_cache
-
-        payload = response.json()
-        content = base64.b64decode(payload["content"]).decode("utf-8")
-        loaded = json.loads(content)
-
-        if not isinstance(loaded, dict):
-            loaded = dict(DEFAULT_DATA)
-
-        loaded.setdefault("items", [])
-        loaded.setdefault("last_feed_index", 0)
-        loaded.setdefault("pending", {})
-
-        _data_cache = loaded
-        _data_sha = payload["sha"]
-        pending_queue = _data_cache["pending"]
-
-        print(f"💾 Загружено pending: {len(pending_queue)} записей")
-        return _data_cache
-
-    except Exception as error:
-        print(f"❌ Ошибка загрузки данных из GitHub: {error}")
-        _data_cache = dict(DEFAULT_DATA)
+        else:
+            payload = r.json()
+            loaded = json.loads(base64.b64decode(payload["content"]).decode())
+            loaded.setdefault("items", [])
+            loaded.setdefault("pending", {})
+            _data = loaded
+            _data_sha = payload["sha"]
+    except Exception as e:
+        print(f"❌ load: {e}")
+        _data = dict(DEFAULT_DATA)
         _data_sha = None
-        pending_queue = _data_cache["pending"]
-        return _data_cache
+
+    pending_queue = _data["pending"]
+    print(f"💾 Загружено: {len(_data['items'])} items, {len(pending_queue)} pending")
+    return _data
 
 
-def _save_data_sync(attempt=1):
+def _save_sync(attempt=1):
     global _data_sha
-
     if attempt > 3:
-        print("⚠️ save_data: превышено число попыток, пропускаю")
         return False
 
+    _data["pending"] = pending_queue
     try:
-        _data_cache["pending"] = pending_queue
-
-        items_count = len(_data_cache.get("items", []))
-        pending_count = len(_data_cache.get("pending", {}))
-        print(
-            f"💾 _save_data_sync: попытка {attempt}, "
-            f"{items_count} items, {pending_count} pending"
-        )
-
-        content = json.dumps(_data_cache, ensure_ascii=False, indent=2)
-        encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-
+        content = json.dumps(_data, ensure_ascii=False, indent=2)
         payload = {
-            "message": f"Update seen_news ({time.strftime('%Y-%m-%d %H:%M')})",
-            "content": encoded,
-            "committer": {
-                "name": "vibe-news-bot",
-                "email": "bot@vibe.news",
-            },
+            "message": f"Update ({time.strftime('%Y-%m-%d %H:%M')})",
+            "content": base64.b64encode(content.encode()).decode(),
+            "committer": {"name": "bot", "email": "bot@vibe.news"},
         }
-
         if _data_sha:
             payload["sha"] = _data_sha
 
-        response = requests.put(
-            _gh_url(GITHUB_DATA_FILE),
-            headers=GH_HEADERS,
-            json=payload,
-            timeout=10,
-        )
+        r = requests.put(_gh_url(), headers=GH_HEADERS, json=payload, timeout=10)
 
-        print(f"💾 _save_data_sync: ответ {response.status_code}")
+        if r.status_code == 409:
+            print("⚠️ 409, перечитываю...")
+            _load_sync()
+            return _save_sync(attempt + 1)
 
-        if response.status_code == 409:
-            print("⚠️ Конфликт SHA, перечитываю...")
-            _load_data_sync()
-            return _save_data_sync(attempt + 1)
-
-        if response.status_code not in (200, 201):
-            print(
-                f"⚠️ Ошибка сохранения: {response.status_code} "
-                f"{response.text[:300]}"
-            )
+        if r.status_code not in (200, 201):
+            print(f"⚠️ GitHub PUT {r.status_code}: {r.text[:200]}")
             return False
 
-        result = response.json()
-        _data_sha = result["content"]["sha"]
-        print(f"✅ _save_data_sync: сохранено")
+        _data_sha = r.json()["content"]["sha"]
+        print(f"✅ Сохранено: {len(_data['items'])} items, {len(pending_queue)} pending")
         return True
-
-    except Exception as error:
-        print(f"❌ Ошибка сохранения данных: {type(error).__name__}: {error}")
+    except Exception as e:
+        print(f"❌ save: {e}")
         return False
 
 
 async def load_data():
     async with _data_lock:
-        return await asyncio.to_thread(_load_data_sync)
+        return await asyncio.to_thread(_load_sync)
 
 
 async def save_data():
     try:
         async with _data_lock:
             return await asyncio.wait_for(
-                asyncio.to_thread(_save_data_sync),
-                timeout=30,
+                asyncio.to_thread(_save_sync), timeout=30
             )
     except asyncio.TimeoutError:
-        print("⚠️ save_data: таймаут 30 секунд, пропускаю")
+        print("⚠️ save timeout")
         return False
 
 
-def is_seen(item_key):
-    if not isinstance(_data_cache, dict):
-        return False
-    return item_key in _data_cache.get("items", [])
+def is_seen(key):
+    return key in _data.get("items", [])
 
 
-def mark_seen(item_key):
-    if not isinstance(_data_cache, dict):
-        return
-    items = _data_cache.setdefault("items", [])
-    if item_key not in items:
-        items.append(item_key)
+def mark_seen(key):
+    items = _data.setdefault("items", [])
+    if key not in items:
+        items.append(key)
     if len(items) > 2000:
-        _data_cache["items"] = items[-2000:]
-
-
-def get_last_feed_index():
-    if not isinstance(_data_cache, dict):
-        return 0
-    return int(_data_cache.get("last_feed_index", 0) or 0)
-
-
-def set_last_feed_index(index):
-    if not isinstance(_data_cache, dict):
-        return
-    _data_cache["last_feed_index"] = index
+        _data["items"] = items[-2000:]
 
 
 # ---------- Flask ----------
@@ -286,30 +185,24 @@ flask_app = Flask(__name__)
 
 
 @flask_app.route("/")
-def home():
-    return "Bot is running", 200
-
-
 @flask_app.route("/health")
 def health():
     return "OK", 200
 
 
 def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 
 # ---------- Обработка RSS ----------
 
-def clean_html(raw_text):
-    if not raw_text:
+def clean_html(raw):
+    if not raw:
         return ""
-    text = re.sub(r"<[^>]*>", " ", raw_text)
+    text = re.sub(r"<[^>]*>", " ", raw)
     text = html.unescape(text)
     text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def get_summary(entry):
@@ -322,51 +215,43 @@ def get_summary(entry):
 
 
 def get_item_key(entry, feed_url, title):
-    source_id = (
-        getattr(entry, "id", None)
-        or getattr(entry, "link", None)
-        or f"{feed_url}:{title}"
-    )
-    return hashlib.sha256(source_id.encode("utf-8")).hexdigest()
+    source_id = getattr(entry, "id", None) or getattr(entry, "link", None) or f"{feed_url}:{title}"
+    return hashlib.sha256(source_id.encode()).hexdigest()
 
 
-def extract_image(entry, summary_html=""):
+def extract_image(entry, raw_summary=""):
     for field in ("media_content", "media_thumbnail"):
         for media in getattr(entry, field, None) or []:
-            image_url = media.get("url")
-            if image_url:
-                return image_url
+            if media.get("url"):
+                return media["url"]
 
-    for enclosure in getattr(entry, "enclosures", None) or []:
-        if "image" in enclosure.get("type", ""):
-            image_url = enclosure.get("href")
-            if image_url:
-                return image_url
+    for enc in getattr(entry, "enclosures", None) or []:
+        if "image" in enc.get("type", "") and enc.get("href"):
+            return enc["href"]
 
-    match = re.search(
-        r"""<img[^>]+src=["']([^"']+)["']""",
-        summary_html or "",
-        flags=re.IGNORECASE,
-    )
+    match = re.search(r"""<img[^>]+src=["']([^"']+)["']""", raw_summary or "", re.IGNORECASE)
     return match.group(1) if match else None
 
 
-# ---------- Фильтр не-новостей ----------
+# ---------- Фильтр ----------
 
-NON_NEWS_MARKERS = [
+BLOCK_MARKERS = [
+    # Блоги
     "туториал", "руководство", "как я ", "как сделать",
     "мнение", "колонка", "перевод", "личный опыт",
     "урок", "гайд", "how to", "tutorial", "заметки",
-    "мой проект", "я решил", "я сделал",
+    # Политика и негатив
+    "украин", "война", "конфликт", "санкции", "трамп",
+    "путин", "зеленск", "нато", "оружие",
+    "кризис", "обвал", "катастрофа", "трагедия",
+    "погиб", "умер", "убит", "авария", "теракт",
+    "протест", "митинг", "арест", "приговор",
 ]
 
 
 def is_news_item(title, summary):
     text = f"{title} {summary}".lower()
-    for marker in NON_NEWS_MARKERS:
-        if marker in text:
-            return False
-    return True
+    return not any(marker in text for marker in BLOCK_MARKERS)
 
 
 # ---------- AI ----------
@@ -376,16 +261,15 @@ def rewrite_with_ai(title, summary):
         return None
 
     prompt = f"""Ты — автор позитивного молодёжного Telegram-канала.
-Напиши самостоятельный короткий пост на русском языке по заголовку и описанию.
-Пиши живо, неформально, с лёгким юмором.
+Напиши короткий пост на русском по заголовку и описанию.
+Живо, неформально, с лёгким юмором.
 
 ПРАВИЛА:
-- Начни с одного яркого эмодзи по смыслу новости (🚀, 🔥, 💡, 🎉, 🌟, 🤯, 😎, 💥, 🎮, 🎵, 🧠, 🌍, ✨).
-- Используй МНОГО эмодзи: от 6 до 10 штук по ходу текста.
-- Эмодзи должны подходить по смыслу — не ставь их наугад.
-- Не более 3-4 предложений.
-- До 800 символов.
-- Не добавляй ссылки и не придумывай факты.
+- Начни с яркого эмодзи по смыслу (🚀, 🔥, 💡, 🎉, 🌟, 🤯, 😎, 💥, 🎮, 🎵, 🧠, 🌍, ✨).
+- Используй 6-10 эмодзи по ходу текста, по смыслу.
+- 3-4 предложения, до 800 символов.
+- Без ссылок, не выдумывай факты.
+- Если новость негативная или политическая — верни ровно слово ОТКАЗ.
 
 Заголовок: {title}
 Описание: {summary}
@@ -393,128 +277,104 @@ def rewrite_with_ai(title, summary):
 Текст поста:"""
 
     try:
-        response = groq_client.chat.completions.create(
+        r = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.9,
             max_tokens=300,
         )
-        if not response.choices:
+        if not r.choices:
             return None
-        result = response.choices[0].message.content
+        result = r.choices[0].message.content
         if not result:
             return None
-        result = re.sub(r"https?://\S+", "", result.strip()).strip()
+        result = result.strip()
+
+        if result.upper() == "ОТКАЗ":
+            print(f"⏭ AI отказался: {title[:60]}")
+            return None
+
+        result = re.sub(r"https?://\S+", "", result).strip()
         if len(result) > 1000:
             result = result[:997].rstrip() + "..."
         if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", result)) < 10:
             return None
         return result
-    except Exception as error:
-        print(f"❌ Ошибка Groq: {type(error).__name__}: {error}")
+    except Exception as e:
+        print(f"❌ Groq: {type(e).__name__}: {e}")
         return None
 
 
-def make_post_text(title, summary):
-    ai_text = rewrite_with_ai(title, summary)
-    if ai_text:
-        return ai_text
-    if summary:
-        return f"🔥 {title}\n\n{summary} ✨"[:1000]
-    return None
-
-
-# ---------- Поиск новости ----------
+# ---------- Поиск ----------
 
 _find_lock = asyncio.Lock()
 
 
 async def find_one_new_entry():
-    print("🟠 find_one_new_entry: старт")
-    global _data_cache
-    if not isinstance(_data_cache, dict):
-        _data_cache = dict(DEFAULT_DATA)
-
     async with _find_lock:
-        total_feeds = len(RSS_FEEDS)
-        feed_indices = list(range(total_feeds))
-        random.shuffle(feed_indices)
+        feeds = list(RSS_FEEDS)
+        random.shuffle(feeds)
 
-        for feed_index in feed_indices:
-            feed_url = RSS_FEEDS[feed_index]
-
+        for feed_url in feeds:
             try:
                 feed = await asyncio.to_thread(feedparser.parse, feed_url)
                 if not feed.entries:
                     continue
 
-                fresh_entries = []
+                fresh = []
                 for entry in feed.entries:
-                    title = clean_html(
-                        getattr(entry, "title", "") or ""
-                    ) or "Без заголовка"
-
-                    item_key = get_item_key(entry, feed_url, title)
-                    if is_seen(item_key):
+                    title = clean_html(getattr(entry, "title", "") or "") or "Без заголовка"
+                    key = get_item_key(entry, feed_url, title)
+                    if is_seen(key):
                         continue
 
                     summary = get_summary(entry)
                     if not is_news_item(title, summary):
-                        print(f"⏭ Пропускаю не-новость: {title[:80]}")
-                        mark_seen(item_key)
+                        mark_seen(key)
                         continue
 
-                    fresh_entries.append({
+                    fresh.append({
                         "entry": entry,
                         "title": title,
                         "feed_url": feed_url,
-                        "item_key": item_key,
+                        "key": key,
                     })
 
-                if not fresh_entries:
-                    continue
+                if fresh:
+                    print(f"📡 Источник: {feed_url}")
+                    return random.choice(fresh)
 
-                chosen = random.choice(fresh_entries)
-                set_last_feed_index((feed_index + 1) % total_feeds)
-                print(f"📡 Источник: {feed_url}")
-                return chosen
-
-            except Exception as error:
-                print(
-                    f"❌ Ошибка чтения RSS {feed_url}: "
-                    f"{type(error).__name__}: {error}"
-                )
+            except Exception as e:
+                print(f"❌ RSS {feed_url}: {type(e).__name__}: {e}")
 
         return None
 
 
-# ---------- Вспомогательная функция для кнопок ----------
+# ---------- Утилиты ----------
 
 async def safe_edit(query, text):
     try:
         await query.edit_message_text(text)
-        return
     except Exception:
-        pass
+        try:
+            await query.edit_message_caption(caption=text)
+        except Exception as e:
+            print(f"⚠️ edit: {e}")
 
-    try:
-        await query.edit_message_caption(caption=text)
+
+# ---------- Отправка ----------
+
+async def find_and_send_next(app, depth=0):
+    if depth > 3:
+        await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Не нашёл подходящих новостей.")
         return
-    except Exception as error:
-        print(f"⚠️ Не удалось отредактировать сообщение: {error}")
 
-
-# ---------- Отправка админу ----------
-
-async def find_and_send_next(application):
-    print("🟡 find_and_send_next: старт")
     candidate = await find_one_new_entry()
-    print(f"🟡 find_and_send_next: candidate = {candidate is not None}")
 
     if not candidate:
-        await application.bot.send_message(
+        await app.bot.send_message(
             chat_id=ADMIN_ID,
-            text="😔 Больше новых новостей нет. Пришлю, когда появятся.",
+            text="😔 Больше новых новостей нет.",
         )
         return
 
@@ -525,18 +385,15 @@ async def find_and_send_next(application):
     raw_summary = getattr(entry, "summary", "") or ""
     image_url = extract_image(entry, raw_summary)
 
-    post_text = await asyncio.to_thread(make_post_text, title, summary)
+    post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
     if not post_text:
-        await application.bot.send_message(
-            chat_id=ADMIN_ID,
-            text="😔 Не удалось сгенерировать текст. Нажми /now.",
-        )
-        return
+        mark_seen(candidate["key"])
+        await save_data()
+        return await find_and_send_next(app, depth + 1)
 
-    mark_seen(candidate["item_key"])
-
-    review_id = str(uuid.uuid4())[:8]
+    mark_seen(candidate["key"])
+    review_id = uuid.uuid4().hex[:8]
 
     pending_queue[review_id] = {
         "title": title,
@@ -544,197 +401,131 @@ async def find_and_send_next(application):
         "image_url": image_url,
         "source_url": source_url,
     }
-
-    # Сохраняем только здесь — после успешного добавления
     await save_data()
 
     message_text = f"📬 Новость на проверку\n\n{post_text}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Опубликовать", callback_data=f"publish:{review_id}"),
+        InlineKeyboardButton("⏭ Пропустить", callback_data=f"skip:{review_id}"),
+    ]])
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Опубликовать",
-                callback_data=f"publish:{review_id}",
-            ),
-            InlineKeyboardButton(
-                "⏭ Пропустить",
-                callback_data=f"skip:{review_id}",
-            ),
-        ]
-    ])
-
-    if image_url:
-        try:
-            await application.bot.send_photo(
+    try:
+        if image_url:
+            await app.bot.send_photo(
                 chat_id=ADMIN_ID,
                 photo=image_url,
                 caption=message_text[:1024],
                 reply_markup=keyboard,
             )
-        except Exception as photo_error:
-            print(f"⚠️ Фото не отправилось: {photo_error}")
-            await application.bot.send_message(
+        else:
+            await app.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=message_text[:4096],
                 reply_markup=keyboard,
             )
-    else:
-        await application.bot.send_message(
+    except Exception as e:
+        print(f"⚠️ send: {e}")
+        await app.bot.send_message(
             chat_id=ADMIN_ID,
             text=message_text[:4096],
             reply_markup=keyboard,
         )
 
-    print(f"📩 Новость отправлена админу: {title}")
+    print(f"📩 Отправлено: {title}")
 
 
 # ---------- Кнопки ----------
 
-async def review_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    if not query:
+async def review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or q.from_user.id != ADMIN_ID:
         return
 
-    if query.from_user.id != ADMIN_ID:
-        await query.answer("Только для админа.", show_alert=True)
-        return
-
-    await query.answer()
-
-    try:
-        action, review_id = query.data.split(":", 1)
-    except (ValueError, AttributeError):
-        return
-
+    await q.answer()
+    action, review_id = q.data.split(":", 1)
     item = pending_queue.get(review_id)
 
     if not item:
-        await safe_edit(query, "Эта новость уже обработана.")
+        await safe_edit(q, "Эта новость уже обработана.")
         return
 
     if action == "skip":
         del pending_queue[review_id]
         await save_data()
-        await safe_edit(query, "⏭ Пропущено. Ищу следующую...")
-        print(f"⏭ Пропущено: {item['title']}")
-        try:
-            await find_and_send_next(context.application)
-        except Exception as error:
-            print(f"❌ Ошибка после skip: {error}")
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="❌ Не удалось найти следующую. Смотри логи Render.",
-            )
+        await safe_edit(q, "⏭ Пропущено. Ищу следующую...")
+        await find_and_send_next(ctx.application)
         return
 
-    if action == "publish":
-        try:
-            post_text = item["post_text"]
-            image_url = item["image_url"]
+    try:
+        post_text = item["post_text"]
+        image_url = item["image_url"]
 
-            if image_url and len(post_text) <= 1024:
-                try:
-                    await context.bot.send_photo(
-                        chat_id=CHANNEL_ID,
-                        photo=image_url,
-                        caption=post_text,
-                    )
-                except Exception:
-                    await context.bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=post_text[:4096],
-                    )
-            else:
-                await context.bot.send_message(
-                    chat_id=CHANNEL_ID,
-                    text=post_text[:4096],
-                )
+        if image_url and len(post_text) <= 1024:
+            try:
+                await ctx.bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=post_text)
+            except Exception:
+                await ctx.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
+        else:
+            await ctx.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
 
-            del pending_queue[review_id]
-            await save_data()
-            await safe_edit(
-                query,
-                f"✅ Опубликовано: {item['title'][:60]}",
-            )
-            print(f"✅ Опубликовано: {item['title']}")
-
-        except Exception as error:
-            await safe_edit(
-                query,
-                "❌ Не удалось опубликовать. Смотри логи.",
-            )
-            print(f"❌ Ошибка публикации: {error}")
+        del pending_queue[review_id]
+        await save_data()
+        await safe_edit(q, f"✅ Опубликовано: {item['title'][:60]}")
+        print(f"✅ Опубликовано: {item['title']}")
+    except Exception as e:
+        await safe_edit(q, "❌ Ошибка публикации. Смотри логи.")
+        print(f"❌ publish: {e}")
 
 
 # ---------- Планировщик ----------
 
-async def news_scheduler(application: Application):
+async def scheduler(app):
     while True:
         try:
-            if pending_queue:
-                await asyncio.sleep(60)
-                continue
-
-            try:
-                await find_and_send_next(application)
-            except Exception as error:
-                print(f"❌ Ошибка планировщика: {error}")
-
+            if not pending_queue:
+                try:
+                    await find_and_send_next(app)
+                except Exception as e:
+                    print(f"❌ scheduler: {e}")
             await asyncio.sleep(7200)
-
         except asyncio.CancelledError:
             raise
-        except Exception as error:
-            print(f"❌ Ошибка планировщика: {error}")
+        except Exception as e:
+            print(f"❌ scheduler: {e}")
             await asyncio.sleep(60)
 
 
 # ---------- Команды ----------
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Нет доступа.")
         return
     await update.message.reply_text(
         "Бот подключён.\n\n"
-        "/now — прислать новость сейчас.\n"
-        "/pending — показать очередь.\n"
-        "/reset — очистить очередь."
+        "/now — прислать новость сейчас\n"
+        "/pending — показать очередь\n"
+        "/reset — очистить очередь"
     )
 
 
-async def force_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
+async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
     if pending_queue:
         pending_queue.clear()
         await save_data()
-        await update.message.reply_text(
-            "🗑 Старая очередь очищена. Ищу новую..."
-        )
+        await update.message.reply_text("🗑 Очередь очищена. Ищу новую...")
     else:
-        await update.message.reply_text("🔍 Ищу свежую новость...")
+        await update.message.reply_text("🔍 Ищу...")
 
     try:
-        await find_and_send_next(context.application)
-    except Exception as error:
-        print(f"❌ Ошибка в /now: {error}")
-        await update.message.reply_text(
-            "❌ Что-то пошло не так. Смотри логи Render."
-        )
+        await find_and_send_next(ctx.application)
+    except Exception as e:
+        print(f"❌ /now: {e}")
 
 
-async def show_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
+async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -742,74 +533,49 @@ async def show_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Очередь пуста.")
         return
 
-    text = f"📋 В очереди: {len(pending_queue)} новостей\n\n"
+    text = f"📋 В очереди: {len(pending_queue)}\n\n"
     for rid, item in pending_queue.items():
         text += f"• {rid}: {item['title'][:60]}\n"
-
     await update.message.reply_text(text[:4096])
 
 
-async def reset_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-
     count = len(pending_queue)
     pending_queue.clear()
     await save_data()
-    await update.message.reply_text(f"🗑 Очередь очищена ({count} шт.).")
+    await update.message.reply_text(f"🗑 Очищено ({count}).")
 
 
 # ---------- Запуск ----------
 
-async def post_init(application: Application):
-    print("🔵 post_init: старт")
-    try:
-        await load_data()
-        print("🔵 post_init: load_data завершён")
-    except Exception as error:
-        print(f"❌ post_init: ошибка load_data: {type(error).__name__}: {error}")
-
-    if not isinstance(_data_cache, dict):
-        print("⚠️ _data_cache пуст, инициализирую")
-        globals()["_data_cache"] = dict(DEFAULT_DATA)
-        globals()["pending_queue"] = _data_cache["pending"]
-
-    print(
-        f"✅ Загружено {len(_data_cache.get('items', []))} "
-        f"просмотренных новостей из GitHub, "
-        f"{len(pending_queue)} в очереди"
-    )
-
-    application.bot_data["scheduler_task"] = asyncio.create_task(
-        news_scheduler(application)
-    )
-    print("🟢 post_init: планировщик запущен")
-
-    await application.bot.set_my_commands([
-        ("start", "Запустить бота"),
-        ("now", "Прислать новость сейчас"),
-        ("pending", "Показать очередь"),
-        ("reset", "Очистить очередь"),
+async def post_init(app: Application):
+    await load_data()
+    app.bot_data["scheduler"] = asyncio.create_task(scheduler(app))
+    await app.bot.set_my_commands([
+        ("start", "Запустить"),
+        ("now", "Новость сейчас"),
+        ("pending", "Очередь"),
+        ("reset", "Очистить"),
     ])
-    print("🟢 post_init: команды зарегистрированы")
+    print("✅ Бот готов")
 
 
-async def post_shutdown(application: Application):
-    task = application.bot_data.get("scheduler_task")
+async def post_shutdown(app: Application):
+    task = app.bot_data.get("scheduler")
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
 
 def main():
-    lock_fd = acquire_lock()
-    print(f"🔒 Блокировка захвачена, PID = {os.getpid()}")
+    acquire_lock()
+    print(f"🔒 PID = {os.getpid()}")
 
     threading.Thread(target=run_flask, daemon=True).start()
 
-    application = (
+    app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .post_init(post_init)
@@ -817,18 +583,13 @@ def main():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("now", force_fetch))
-    application.add_handler(CommandHandler("pending", show_pending))
-    application.add_handler(CommandHandler("reset", reset_pending))
-    application.add_handler(
-        CallbackQueryHandler(
-            review_callback,
-            pattern=r"^(publish|skip):[a-f0-9]+$",
-        )
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("now", cmd_now))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^(publish|skip):[a-f0-9]+$"))
 
-    application.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
