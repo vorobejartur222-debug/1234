@@ -31,7 +31,7 @@ from werkzeug.serving import make_server
 
 
 # ============================================================
-# Настройки и переменные окружения
+# Настройки
 # ============================================================
 
 def required_env(name: str) -> str:
@@ -60,7 +60,7 @@ except ZoneInfoNotFoundError as exc:
 
 AUTO_PUBLISH_MINUTES = int(os.environ.get("AUTO_PUBLISH_MINUTES", "60"))
 
-# Проверка до шести RSS-лент одновременно.
+# RSS проверяются параллельно, но ограничиваем число одновременных запросов.
 MAX_PARALLEL_FEEDS = 6
 FEED_CONNECT_TIMEOUT = 3
 FEED_READ_TIMEOUT = 6
@@ -75,7 +75,7 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
 # ============================================================
-# Защита от двойного запуска в одном контейнере
+# Защита от двойного запуска внутри одного контейнера
 # ============================================================
 
 LOCK_FILE = "/tmp/bot.lock"
@@ -84,8 +84,8 @@ _LOCK_FD = None
 
 def acquire_lock():
     """
-    Не позволяет запустить два процесса бота в одном контейнере.
-    Не защищает от другого сервиса Render или локального компьютера.
+    Защищает от двух процессов бота в одном контейнере.
+    Не предотвращает запуск бота на другом сервисе или компьютере.
     """
     global _LOCK_FD
 
@@ -103,8 +103,7 @@ def acquire_lock():
     lock_fd.write(str(os.getpid()))
     lock_fd.flush()
 
-    # Нельзя закрывать файл, пока работает процесс:
-    # вместе с ним снимется файловая блокировка.
+    # Держим дескриптор открытым всё время работы процесса.
     _LOCK_FD = lock_fd
 
 
@@ -128,7 +127,7 @@ RSS_FEEDS = [
 
 
 # ============================================================
-# GitHub-хранилище
+# Данные и GitHub-хранилище
 # ============================================================
 
 def fresh_default_data():
@@ -174,8 +173,7 @@ def _load_sync():
         )
 
         if response.status_code == 404:
-            # Файл ещё не создан. Первый успешный PUT создаст его.
-            print("ℹ️ Файл данных в GitHub не найден; создадим его при сохранении.")
+            print("ℹ️ Файл данных GitHub не найден; он будет создан при сохранении.")
             _data = fresh_default_data()
             _data_sha = None
 
@@ -189,8 +187,8 @@ def _load_sync():
 
         else:
             payload = response.json()
-            content = base64.b64decode(payload["content"]).decode("utf-8")
-            loaded = json.loads(content)
+            file_content = base64.b64decode(payload["content"]).decode("utf-8")
+            loaded = json.loads(file_content)
 
             _data = fresh_default_data()
             _data.update(loaded)
@@ -266,12 +264,10 @@ def _save_sync():
             )
 
             if response.status_code in (200, 201):
-                result = response.json()
-                _data_sha = result.get("content", {}).get("sha")
+                _data_sha = response.json().get("content", {}).get("sha")
                 return True
 
             if response.status_code == 409 and attempt < 2:
-                # GitHub сообщает, что SHA устарел. Получаем актуальный.
                 current = requests.get(
                     GITHUB_CONTENTS_URL,
                     headers=GH_HEADERS,
@@ -329,7 +325,6 @@ def mark_seen(key: str):
     if key not in items:
         items.append(key)
 
-    # Ограничиваем размер JSON-файла.
     if len(items) > 2000:
         _data["items"] = items[-2000:]
 
@@ -346,7 +341,7 @@ def bump_source(feed_url: str):
 
 
 # ============================================================
-# Flask health-check
+# Flask health-check для Render
 # ============================================================
 
 flask_app = Flask(__name__)
@@ -359,7 +354,7 @@ def health():
 
 
 # ============================================================
-# RSS: очистка, фильтр и поиск
+# RSS: обработка и фильтр
 # ============================================================
 
 def clean_html(raw: str) -> str:
@@ -417,6 +412,15 @@ BLOCK_MARKERS = [
     "как сделать",
     "how to",
     "tutorial",
+    "война",
+    "убит",
+    "погиб",
+    "теракт",
+    "катастрофа",
+    "трагедия",
+    "авария",
+    "смерть",
+    "умер",
 ]
 
 
@@ -426,7 +430,6 @@ def is_news_item(title: str, summary: str) -> bool:
 
 
 def parse_feed_sync(feed_url: str):
-    """Скачивает и разбирает одну RSS-ленту."""
     response = requests.get(
         feed_url,
         headers={"User-Agent": "VibeNewsBot/1.0"},
@@ -440,7 +443,7 @@ async def fetch_fresh_from_feed(
     feed_url: str,
     semaphore: asyncio.Semaphore,
 ):
-    """Проверяет одну ленту и возвращает новые подходящие записи."""
+    """Проверяет одну ленту и возвращает подходящие новые записи."""
     async with semaphore:
         try:
             feed = await asyncio.wait_for(
@@ -488,15 +491,11 @@ async def fetch_fresh_from_feed(
 
 
 async def find_one_new_entry():
-    """
-    Проверяет RSS параллельно и отдаёт первую найденную новость.
-    Медленные ленты не блокируют весь поиск.
-    """
+    """Параллельно проверяет RSS и возвращает первую найденную новость."""
     feeds = list(RSS_FEEDS)
     random.shuffle(feeds)
 
     semaphore = asyncio.Semaphore(MAX_PARALLEL_FEEDS)
-
     tasks = {
         asyncio.create_task(fetch_fresh_from_feed(url, semaphore))
         for url in feeds
@@ -533,7 +532,7 @@ async def find_one_new_entry():
 
 
 # ============================================================
-# Groq: создание текста поста
+# Groq: генерация законченного текста
 # ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
@@ -541,73 +540,84 @@ def rewrite_with_ai(title: str, summary: str):
         print("⚠️ GROQ_API_KEY не задан.")
         return None
 
-    prompt = prompt = f"""Ты — редактор молодёжного Telegram-канала +VIBE NEWS.
-Подготовь короткий, понятный и содержательный пост на русском языке
-по заголовку и описанию источника.
+    prompt = f"""Ты — редактор молодёжного Telegram-канала +VIBE NEWS.
+Напиши короткий, связный и содержательный пост на русском языке.
 
-СТИЛЬ:
-- Пиши естественно и уважительно, без искусственного хайпа.
-- Тон дружелюбный, но чуть более серьёзный и информативный.
-- Не используй сленг, если он не нужен для смысла.
-- Объясни, что произошло и почему это может быть интересно читателю.
-- Не добавляй вступления вроде «Стало известно» или «В сети обсуждают».
+Главная задача:
+- Рассказывай только об одном событии.
+- Если заголовок или описание упоминает несколько событий, выбери главное событие из заголовка и не смешивай его с остальными.
+- Излагай мысль последовательно: что произошло и, если это прямо указано в источнике, почему это важно.
+- Используй только факты из предоставленных материалов. Ничего не выдумывай.
 
-ФАКТИЧНОСТЬ:
-- Используй только факты из заголовка и описания.
-- Не придумывай цифры, причины, последствия, цитаты и детали.
-- Если информации недостаточно, сформулируй текст осторожно и не додумывай.
-- Сохрани важные оговорки и неопределённость оригинала.
-- Не выдавай мнение за факт.
+Стиль:
+- Дружелюбный и спокойный, немного серьёзнее обычного развлекательного поста.
+- Без навязчивого сленга, кликбейта и громких неподтверждённых заявлений.
+- Пиши естественно, простыми словами.
 
-ФОРМАТ:
-- 2–4 коротких предложения.
-- До 700 символов.
-- Один уместный эмодзи в начале; остальные — только если действительно подходят.
-- Не добавляй ссылки и хэштеги.
-- В конце можно задать короткий вопрос по теме, если это звучит естественно.
+Формат:
+- 2–3 законченных предложения.
+- Не более 500 символов.
+- Начни с одного уместного эмодзи.
+- Закончи полной фразой с точкой.
+- Не добавляй ссылки, хэштеги, заголовок или комментарии о своей работе.
 
-Заголовок:
+Заголовок источника:
 {title}
 
-Описание:
+Описание источника:
 {summary}
 
-Готовый пост:"""
+Напиши только готовый пост:"""
 
-    try:
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=300,
-        )
+    for attempt in range(2):
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=500,
+            )
 
-        if not response.choices:
+            if not response.choices:
+                print("⚠️ Groq вернул пустой ответ.")
+                continue
+
+            choice = response.choices[0]
+            text = (choice.message.content or "").strip()
+            finish_reason = getattr(choice, "finish_reason", None)
+
+            print(f"ℹ️ Groq finish_reason={finish_reason}")
+
+            # Модель упёрлась в лимит токенов — пробуем ещё раз.
+            if finish_reason == "length":
+                print("⚠️ Ответ Groq обрезан лимитом, повторяю запрос.")
+                continue
+
+            text = re.sub(r"https?://\S+", "", text).strip()
+
+            # Если модель оборвала фразу, повторяем запрос один раз.
+            if not text or text[-1] not in ".!?…»”":
+                print(f"⚠️ Groq вернул незавершённый текст: {text[-120:]}")
+                continue
+
+            if len(text) > 700:
+                text = text[:697].rsplit(" ", 1)[0].rstrip() + "..."
+
+            if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", text)) < 10:
+                print("⚠️ Ответ Groq слишком короткий или некорректный.")
+                continue
+
+            return text
+
+        except Exception as exc:
+            print(f"❌ Groq: {type(exc).__name__}: {exc}")
             return None
 
-        text = response.choices[0].message.content
-
-        if not text:
-            return None
-
-        text = text.strip()
-        text = re.sub(r"https?://\S+", "", text).strip()
-
-        if len(text) > 1000:
-            text = text[:997].rstrip() + "..."
-
-        if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", text)) < 10:
-            return None
-
-        return text
-
-    except Exception as exc:
-        print(f"❌ Groq: {type(exc).__name__}: {exc}")
-        return None
+    return None
 
 
 # ============================================================
-# Telegram: клавиатура и отправка
+# Telegram: отправка и модерация
 # ============================================================
 
 def build_keyboard(review_id: str):
@@ -630,7 +640,7 @@ async def safe_edit(query, text: str):
         try:
             await query.edit_message_caption(caption=text)
         except Exception as exc:
-            print(f"⚠️ Не удалось обновить Telegram-сообщение: {exc}")
+            print(f"⚠️ Не удалось изменить сообщение: {exc}")
 
 
 async def find_and_send_next(
@@ -655,7 +665,7 @@ async def find_and_send_next(
         raw_summary = getattr(entry, "summary", "") or ""
         image_url = extract_image(entry, raw_summary)
 
-        # Groq — синхронный запрос, поэтому выполняем его в отдельном потоке.
+        # Не блокируем event loop во время синхронного запроса к Groq.
         post_text = await asyncio.to_thread(
             rewrite_with_ai,
             title,
@@ -725,38 +735,22 @@ async def publish_to_channel(app: Application, item: dict):
 
     if image_url and len(post_text) <= 1024:
         try:
-            message = await app.bot.send_photo(
+            return await app.bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=image_url,
                 caption=post_text,
             )
         except Exception as exc:
-            print(f"⚠️ Не удалось отправить фото, публикую текст: {exc}")
-            message = await app.bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=post_text[:4096],
-            )
-    else:
-        message = await app.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=post_text[:4096],
-        )
+            print(f"⚠️ Не удалось отправить фото: {exc}")
 
-    try:
-        await app.bot.set_message_reaction(
-            chat_id=CHANNEL_ID,
-            message_id=message.message_id,
-            reaction=["🔥", "❤️", "😎"],
-        )
-    except Exception:
-        # Реакции могут быть недоступны для канала.
-        pass
-
-    return message
+    return await app.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=post_text[:4096],
+    )
 
 
 # ============================================================
-# Команды администратора
+# Команды
 # ============================================================
 
 async def start_command(
@@ -770,7 +764,7 @@ async def start_command(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
         "/stats — статистика\n"
-        "/help — помощь"
+        "/help — список команд"
     )
 
 
@@ -810,15 +804,13 @@ async def stats_command(
     stats = _data.get("stats", {})
     sources = stats.get("sources", {})
 
-    text = (
+    await update.effective_message.reply_text(
         "📊 Статистика\n\n"
         f"Опубликовано: {stats.get('published', 0)}\n"
         f"Пропущено: {stats.get('skipped', 0)}\n"
         f"Ожидают решения: {len(pending_queue)}\n"
         f"Источников с публикациями: {len(sources)}"
     )
-
-    await update.effective_message.reply_text(text)
 
 
 async def review_callback(
@@ -884,13 +876,16 @@ async def review_callback(
 # ============================================================
 
 async def auto_publish_loop(app: Application):
-    """Публикует посты, которые ждут решения дольше заданного времени."""
+    """Автопубликует посты, ожидающие решения дольше заданного времени."""
     while True:
         try:
             now = time.time()
 
             for review_id, item in list(pending_queue.items()):
-                created_at = item.get("created_at", now)
+                try:
+                    created_at = float(item.get("created_at", now))
+                except (TypeError, ValueError):
+                    created_at = now
 
                 if now - created_at < AUTO_PUBLISH_MINUTES * 60:
                     continue
@@ -927,7 +922,7 @@ async def auto_publish_loop(app: Application):
 
 
 async def schedule_loop(app: Application):
-    """Плановый поиск в заданные часы в выбранной временной зоне."""
+    """Плановый поиск в заданные часы с учётом TIMEZONE."""
     while True:
         try:
             now = datetime.now(LOCAL_TZ)
@@ -936,7 +931,6 @@ async def schedule_loop(app: Application):
                 slot = now.strftime("%Y-%m-%d-%H")
 
                 if _data.get("last_schedule_slot") != slot:
-                    # Запоминаем слот, чтобы не запускать поиск каждые 30 секунд.
                     _data["last_schedule_slot"] = slot
                     await save_data()
 
@@ -952,8 +946,15 @@ async def schedule_loop(app: Application):
         await asyncio.sleep(30)
 
 
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    print(f"❌ Ошибка Telegram: {context.error}")
+
+
 # ============================================================
-# Запуск и корректная остановка
+# Запуск
 # ============================================================
 
 async def main():
@@ -971,6 +972,7 @@ async def main():
     application.add_handler(CommandHandler("next", next_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(review_callback))
+    application.add_error_handler(error_handler)
 
     port = int(os.environ.get("PORT", "10000"))
 
@@ -1008,7 +1010,7 @@ async def main():
         if application.updater is None:
             raise RuntimeError("У Telegram Application отсутствует Updater")
 
-        # Важно: polling должен работать только в одном экземпляре приложения.
+        # Один polling-запуск для этого токена.
         await application.updater.start_polling()
 
         background_tasks = [
