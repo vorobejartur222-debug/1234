@@ -755,10 +755,6 @@ def main():
 
     app.run_polling(
         drop_pending_updates=True,
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30,
-        pool_timeout=30,
         poll_interval=1.0,
         timeout=1,
     )
