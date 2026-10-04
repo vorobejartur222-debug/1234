@@ -1,5 +1,5 @@
 Flask
-python-telegram-bot==22.10
+python-telegram-bot==22.8
 feedparser
 groq
 requests
