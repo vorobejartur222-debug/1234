@@ -759,6 +759,8 @@ def main():
         write_timeout=30,
         connect_timeout=30,
         pool_timeout=30,
+        poll_interval=1.0,
+        timeout=1,
     )
 
 
