@@ -11,6 +11,7 @@ import time
 import uuid
 import sys
 import fcntl
+from datetime import datetime, timedelta
 
 import requests
 import feedparser
@@ -54,6 +55,11 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 GITHUB_REPO = os.environ["GITHUB_REPO"]
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json")
 
+# Авто-публикация через час, если админ не нажал кнопку
+AUTO_PUBLISH_MINUTES = 60
+# Автопостинг в пиковые часы
+SCHEDULE_HOURS = [10, 14, 18, 22]
+
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
@@ -63,11 +69,14 @@ RSS_FEEDS = [
     "https://nplus1.ru/rss",
     "https://naked-science.ru/feed",
     "https://www.ixbt.com/export/news.rss",
+    "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
     "https://the-flow.ru/rss/",
     "https://www.sports.ru/rss/all.xml",
     "https://kulturomania.ru/rss/",
-    "https://hi-news.ru/feed/",
+    "https://positime.ru/rss/",
+    "https://www.positive.news/feed/",
+    "https://www.optimistdaily.com/feed/",
 ]
 
 
@@ -79,7 +88,12 @@ GH_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-DEFAULT_DATA = {"items": [], "pending": {}}
+DEFAULT_DATA = {
+    "items": [],
+    "pending": {},
+    "stats": {"published": 0, "skipped": 0, "sources": {}},
+    "last_digest": "",
+}
 
 _data = dict(DEFAULT_DATA)
 _data_sha = None
@@ -104,6 +118,8 @@ def _load_sync():
             loaded = json.loads(base64.b64decode(payload["content"]).decode())
             loaded.setdefault("items", [])
             loaded.setdefault("pending", {})
+            loaded.setdefault("stats", {"published": 0, "skipped": 0, "sources": {}})
+            loaded.setdefault("last_digest", "")
             _data = loaded
             _data_sha = payload["sha"]
     except Exception as e:
@@ -135,7 +151,6 @@ def _save_sync(attempt=1):
         r = requests.put(_gh_url(), headers=GH_HEADERS, json=payload, timeout=10)
 
         if r.status_code == 409:
-            print("⚠️ 409, перечитываю...")
             _load_sync()
             return _save_sync(attempt + 1)
 
@@ -144,7 +159,6 @@ def _save_sync(attempt=1):
             return False
 
         _data_sha = r.json()["content"]["sha"]
-        print(f"✅ Сохранено: {len(_data['items'])} items, {len(pending_queue)} pending")
         return True
     except Exception as e:
         print(f"❌ save: {e}")
@@ -163,7 +177,6 @@ async def save_data():
                 asyncio.to_thread(_save_sync), timeout=30
             )
     except asyncio.TimeoutError:
-        print("⚠️ save timeout")
         return False
 
 
@@ -177,6 +190,17 @@ def mark_seen(key):
         items.append(key)
     if len(items) > 2000:
         _data["items"] = items[-2000:]
+
+
+def bump_stat(key):
+    stats = _data.setdefault("stats", {"published": 0, "skipped": 0, "sources": {}})
+    stats[key] = stats.get(key, 0) + 1
+
+
+def bump_source(feed_url):
+    stats = _data.setdefault("stats", {"published": 0, "skipped": 0, "sources": {}})
+    sources = stats.setdefault("sources", {})
+    sources[feed_url] = sources.get(feed_url, 0) + 1
 
 
 # ---------- Flask ----------
@@ -233,19 +257,14 @@ def extract_image(entry, raw_summary=""):
     return match.group(1) if match else None
 
 
-# ---------- Фильтр ----------
+# ---------- Жёсткий фильтр ----------
 
 BLOCK_MARKERS = [
-    # Блоги
     "туториал", "руководство", "как я ", "как сделать",
     "мнение", "колонка", "перевод", "личный опыт",
-    "урок", "гайд", "how to", "tutorial", "заметки",
-    # Политика и негатив
-    "украин", "война", "конфликт", "санкции", "трамп",
-    "путин", "зеленск", "нато", "оружие",
-    "кризис", "обвал", "катастрофа", "трагедия",
-    "погиб", "умер", "убит", "авария", "теракт",
-    "протест", "митинг", "арест", "приговор",
+    "урок", "гайд", "how to", "tutorial",
+    "война", "убит", "погиб", "теракт", "катастрофа",
+    "трагедия", "авария", "смерть", "умер",
 ]
 
 
@@ -256,20 +275,53 @@ def is_news_item(title, summary):
 
 # ---------- AI ----------
 
+def ai_is_positive(title, summary):
+    """AI-фильтр: позитивная ли новость."""
+    if not groq_client:
+        return True
+
+    prompt = f"""Оцени новость. Она позитивная, нейтральная или негативная?
+Ответь ОДНИМ словом: ПОЗИТИВ, НЕЙТРАЛ или НЕГАТИВ.
+Если новость про политику, войну, кризис — НЕГАТИВ.
+
+Заголовок: {title}
+Описание: {summary[:400]}
+
+Ответ:"""
+
+    try:
+        r = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=10,
+        )
+        if not r.choices:
+            return True
+        verdict = r.choices[0].message.content.strip().upper()
+        return "НЕГАТИВ" not in verdict
+    except Exception:
+        return True
+
+
 def rewrite_with_ai(title, summary):
     if not groq_client:
         return None
 
-    prompt = f"""Ты — автор позитивного молодёжного Telegram-канала.
+    prompt = f"""Ты — автор позитивного молодёжного Telegram-канала +VIBE NEWS.
 Напиши короткий пост на русском по заголовку и описанию.
-Живо, неформально, с лёгким юмором.
+Пиши живо, неформально, с лёгким юмором.
+
+СТИЛЬ:
+- Сленг уместен: «вайб», «топчик», «жиза», «кринж», «пушка», «кайф».
+- Задай вопрос подписчикам в конце, если уместно.
+- Не пиши «новость», «сообщается», «по данным».
 
 ПРАВИЛА:
 - Начни с яркого эмодзи по смыслу (🚀, 🔥, 💡, 🎉, 🌟, 🤯, 😎, 💥, 🎮, 🎵, 🧠, 🌍, ✨).
-- Используй 6-10 эмодзи по ходу текста, по смыслу.
+- 6-10 эмодзи по ходу текста.
 - 3-4 предложения, до 800 символов.
 - Без ссылок, не выдумывай факты.
-- Если новость негативная или политическая — верни ровно слово ОТКАЗ.
 
 Заголовок: {title}
 Описание: {summary}
@@ -289,11 +341,6 @@ def rewrite_with_ai(title, summary):
         if not result:
             return None
         result = result.strip()
-
-        if result.upper() == "ОТКАЗ":
-            print(f"⏭ AI отказался: {title[:60]}")
-            return None
-
         result = re.sub(r"https?://\S+", "", result).strip()
         if len(result) > 1000:
             result = result[:997].rstrip() + "..."
@@ -341,7 +388,6 @@ async def find_one_new_entry():
                     })
 
                 if fresh:
-                    print(f"📡 Источник: {feed_url}")
                     return random.choice(fresh)
 
             except Exception as e:
@@ -362,10 +408,17 @@ async def safe_edit(query, text):
             print(f"⚠️ edit: {e}")
 
 
+def build_keyboard(review_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚀 Опубликовать", callback_data=f"publish:{review_id}"),
+        InlineKeyboardButton("⏭️ Дальше", callback_data=f"skip:{review_id}"),
+    ]])
+
+
 # ---------- Отправка ----------
 
 async def find_and_send_next(app, depth=0):
-    if depth > 3:
+    if depth > 5:
         await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Не нашёл подходящих новостей.")
         return
 
@@ -385,14 +438,24 @@ async def find_and_send_next(app, depth=0):
     raw_summary = getattr(entry, "summary", "") or ""
     image_url = extract_image(entry, raw_summary)
 
+    # AI-фильтр негатива
+    if not await asyncio.to_thread(ai_is_positive, title, summary):
+        print(f"⏭ AI: негатив — {title[:60]}")
+        mark_seen(candidate["key"])
+        bump_stat("skipped")
+        await save_data()
+        return await find_and_send_next(app, depth + 1)
+
     post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
     if not post_text:
         mark_seen(candidate["key"])
+        bump_stat("skipped")
         await save_data()
         return await find_and_send_next(app, depth + 1)
 
     mark_seen(candidate["key"])
+    bump_source(candidate["feed_url"])
     review_id = uuid.uuid4().hex[:8]
 
     pending_queue[review_id] = {
@@ -400,14 +463,12 @@ async def find_and_send_next(app, depth=0):
         "post_text": post_text,
         "image_url": image_url,
         "source_url": source_url,
+        "created_at": time.time(),
     }
     await save_data()
 
     message_text = f"📬 Новость на проверку\n\n{post_text}"
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Опубликовать", callback_data=f"publish:{review_id}"),
-        InlineKeyboardButton("⏭ Пропустить", callback_data=f"skip:{review_id}"),
-    ]])
+    keyboard = build_keyboard(review_id)
 
     try:
         if image_url:
@@ -434,6 +495,37 @@ async def find_and_send_next(app, depth=0):
     print(f"📩 Отправлено: {title}")
 
 
+# ---------- Публикация ----------
+
+async def publish_to_channel(app, item):
+    post_text = item["post_text"]
+    image_url = item.get("image_url")
+
+    if image_url and len(post_text) <= 1024:
+        try:
+            msg = await app.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=image_url,
+                caption=post_text,
+            )
+        except Exception:
+            msg = await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
+    else:
+        msg = await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
+
+    # Реакции на пост
+    try:
+        await app.bot.set_message_reaction(
+            chat_id=CHANNEL_ID,
+            message_id=msg.message_id,
+            reaction=["🔥", "❤️", "😎"],
+        )
+    except Exception:
+        pass
+
+    return msg
+
+
 # ---------- Кнопки ----------
 
 async def review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -451,24 +543,16 @@ async def review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "skip":
         del pending_queue[review_id]
+        bump_stat("skipped")
         await save_data()
-        await safe_edit(q, "⏭ Пропущено. Ищу следующую...")
+        await safe_edit(q, "⏭️ Пропущено. Ищу следующую...")
         await find_and_send_next(ctx.application)
         return
 
     try:
-        post_text = item["post_text"]
-        image_url = item["image_url"]
-
-        if image_url and len(post_text) <= 1024:
-            try:
-                await ctx.bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=post_text)
-            except Exception:
-                await ctx.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
-        else:
-            await ctx.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
-
+        await publish_to_channel(ctx.application, item)
         del pending_queue[review_id]
+        bump_stat("published")
         await save_data()
         await safe_edit(q, f"✅ Опубликовано: {item['title'][:60]}")
         print(f"✅ Опубликовано: {item['title']}")
@@ -477,21 +561,91 @@ async def review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         print(f"❌ publish: {e}")
 
 
-# ---------- Планировщик ----------
+# ---------- Авто-публикация через час ----------
 
-async def scheduler(app):
+async def auto_publish_loop(app):
     while True:
         try:
-            if not pending_queue:
+            now = time.time()
+            to_remove = []
+            for rid, item in list(pending_queue.items()):
+                created = item.get("created_at", now)
+                if now - created > AUTO_PUBLISH_MINUTES * 60:
+                    try:
+                        await publish_to_channel(app, item)
+                        bump_stat("published")
+                        to_remove.append(rid)
+                        await app.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=f"⏰ Авто-публикация: {item['title'][:60]}",
+                        )
+                    except Exception as e:
+                        print(f"❌ auto-publish: {e}")
+            if to_remove:
+                for rid in to_remove:
+                    pending_queue.pop(rid, None)
+                await save_data()
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"❌ auto_publish_loop: {e}")
+            await asyncio.sleep(60)
+
+
+# ---------- Планировщик по часам ----------
+
+async def scheduler(app):
+    sent_hours = set()
+    while True:
+        try:
+            now = datetime.now()
+            hour = now.hour
+
+            if hour in SCHEDULE_HOURS and hour not in sent_hours and not pending_queue:
+                sent_hours.add(hour)
                 try:
                     await find_and_send_next(app)
                 except Exception as e:
                     print(f"❌ scheduler: {e}")
-            await asyncio.sleep(7200)
+
+            if hour not in SCHEDULE_HOURS:
+                sent_hours.discard(hour)
+
+            await asyncio.sleep(60)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             print(f"❌ scheduler: {e}")
+            await asyncio.sleep(60)
+
+
+# ---------- Дайджест ----------
+
+async def digest_loop(app):
+    while True:
+        try:
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            last_digest = _data.get("last_digest", "")
+
+            if now.hour == 22 and last_digest != today:
+                stats = _data.get("stats", {})
+                text = (
+                    f"📊 Дайджест за {today}\n\n"
+                    f"✅ Опубликовано: {stats.get('published', 0)}\n"
+                    f"⏭️ Пропущено: {stats.get('skipped', 0)}\n"
+                    f"📋 В очереди: {len(pending_queue)}\n"
+                )
+                await app.bot.send_message(chat_id=ADMIN_ID, text=text)
+                _data["last_digest"] = today
+                await save_data()
+
+            await asyncio.sleep(600)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"❌ digest: {e}")
             await asyncio.sleep(60)
 
 
@@ -502,9 +656,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Бот подключён.\n\n"
-        "/now — прислать новость сейчас\n"
-        "/pending — показать очередь\n"
-        "/reset — очистить очередь"
+        "/now — прислать новость\n"
+        "/pending — очередь\n"
+        "/reset — очистить\n"
+        "/stats — статистика\n"
+        "/edit — редактировать последнюю"
     )
 
 
@@ -548,25 +704,89 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑 Очищено ({count}).")
 
 
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    stats = _data.get("stats", {})
+    sources = stats.get("sources", {})
+    top_sources = sorted(sources.items(), key=lambda x: -x[1])[:5]
+
+    text = (
+        f"📊 Статистика\n\n"
+        f"✅ Опубликовано: {stats.get('published', 0)}\n"
+        f"⏭️ Пропущено: {stats.get('skipped', 0)}\n"
+        f"📋 В очереди: {len(pending_queue)}\n"
+        f"👁 Просмотрено записей: {len(_data.get('items', []))}\n\n"
+        f"🏆 Топ источников:\n"
+    )
+    for url, count in top_sources:
+        short = url.split("//")[1].split("/")[0]
+        text += f"• {short}: {count}\n"
+
+    await update.message.reply_text(text[:4096])
+
+
+async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not pending_queue:
+        await update.message.reply_text("Нет новостей в очереди.")
+        return
+
+    rid, item = list(pending_queue.items())[-1]
+    ctx.user_data["editing"] = rid
+    await update.message.reply_text(
+        f"✏️ Отправь новый текст для поста:\n\n{item['post_text']}"
+    )
+
+
+async def handle_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    rid = ctx.user_data.pop("editing", None)
+    if not rid or rid not in pending_queue:
+        return
+
+    new_text = update.message.text
+    if not new_text:
+        return
+
+    pending_queue[rid]["post_text"] = new_text
+    await save_data()
+    await update.message.reply_text("✅ Текст обновлён.")
+    await find_and_send_next(ctx.application)
+
+
 # ---------- Запуск ----------
 
 async def post_init(app: Application):
     await load_data()
     app.bot_data["scheduler"] = asyncio.create_task(scheduler(app))
+    app.bot_data["auto_publish"] = asyncio.create_task(auto_publish_loop(app))
+    app.bot_data["digest"] = asyncio.create_task(digest_loop(app))
     await app.bot.set_my_commands([
         ("start", "Запустить"),
         ("now", "Новость сейчас"),
         ("pending", "Очередь"),
         ("reset", "Очистить"),
+        ("stats", "Статистика"),
+        ("edit", "Редактировать"),
     ])
     print("✅ Бот готов")
 
 
 async def post_shutdown(app: Application):
-    task = app.bot_data.get("scheduler")
-    if task:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+    for key in ("scheduler", "auto_publish", "digest"):
+        task = app.bot_data.get(key)
+        if task:
+            task.cancel()
+    await asyncio.gather(
+        *[app.bot_data.get(k) for k in ("scheduler", "auto_publish", "digest") if app.bot_data.get(k)],
+        return_exceptions=True,
+    )
 
 
 def main():
@@ -587,7 +807,10 @@ def main():
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^(publish|skip):[a-f0-9]+$"))
+    app.add_handler(CommandHandler("start", handle_edit), group=1)
 
     app.run_polling(drop_pending_updates=True)
 
