@@ -58,10 +58,13 @@ try:
 except ZoneInfoNotFoundError as exc:
     raise RuntimeError(f"Неизвестная временная зона: {TIMEZONE_NAME}") from exc
 
-MAX_PARALLEL_FEEDS = 6
-FEED_CONNECT_TIMEOUT = 3
-FEED_READ_TIMEOUT = 6
-FEED_TOTAL_TIMEOUT = 9
+# Ускоряем: больше параллельных лент, меньше таймауты, меньше записей на ленту
+MAX_PARALLEL_FEEDS = 13
+FEED_CONNECT_TIMEOUT = 2
+FEED_READ_TIMEOUT = 4
+FEED_TOTAL_TIMEOUT = 6
+MAX_ENTRIES_PER_FEED = 10
+MAX_ATTEMPTS = 3
 
 SCHEDULE_HOURS = {10, 14, 18, 22}
 
@@ -115,6 +118,7 @@ RSS_FEEDS = [
     "https://positime.ru/rss/",
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
+    "http://www.gazeta.ru/export/rss/autonews.xml",
     "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
 ]
 
@@ -445,7 +449,8 @@ async def fetch_fresh_from_feed(
 
             fresh = []
 
-            for entry in feed.entries:
+            # Ограничиваем число записей — ускоряет в разы
+            for entry in feed.entries[:MAX_ENTRIES_PER_FEED]:
                 title = (
                     clean_html(getattr(entry, "title", "") or "")
                     or "Без заголовка"
@@ -510,8 +515,12 @@ async def find_one_new_entry():
                     continue
 
                 if fresh:
+                    # Отменяем все оставшиеся задачи — экономим время
                     for pending_task in tasks:
                         pending_task.cancel()
+
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
 
                     return random.choice(fresh)
 
@@ -635,7 +644,7 @@ async def safe_edit(query, text: str):
 
 async def find_and_send_next(
     app: Application,
-    max_attempts: int = 6,
+    max_attempts: int = MAX_ATTEMPTS,
 ):
     for _ in range(max_attempts):
         candidate = await find_one_new_entry()
@@ -865,7 +874,6 @@ async def review_callback(
 # ============================================================
 
 async def schedule_loop(app: Application):
-    """Плановый поиск в заданные часы с учётом TIMEZONE."""
     while True:
         try:
             now = datetime.now(LOCAL_TZ)
