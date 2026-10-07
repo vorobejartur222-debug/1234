@@ -115,6 +115,7 @@ RSS_FEEDS = [
     "https://positime.ru/rss/",
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
+    "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
 ]
 
 
