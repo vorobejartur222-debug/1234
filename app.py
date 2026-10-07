@@ -46,7 +46,7 @@ CHANNEL_ID = required_env("CHANNEL_ID")
 ADMIN_ID = int(required_env("ADMIN_ID"))
 
 GITHUB_TOKEN = required_env("GITHUB_TOKEN")
-GITHUB_REPO = required_env("GITHUB_REPO")  # формат: owner/repository
+GITHUB_REPO = required_env("GITHUB_REPO")
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json").strip()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
@@ -58,9 +58,6 @@ try:
 except ZoneInfoNotFoundError as exc:
     raise RuntimeError(f"Неизвестная временная зона: {TIMEZONE_NAME}") from exc
 
-AUTO_PUBLISH_MINUTES = int(os.environ.get("AUTO_PUBLISH_MINUTES", "60"))
-
-# RSS проверяются параллельно, но ограничиваем число одновременных запросов.
 MAX_PARALLEL_FEEDS = 6
 FEED_CONNECT_TIMEOUT = 3
 FEED_READ_TIMEOUT = 6
@@ -83,10 +80,6 @@ _LOCK_FD = None
 
 
 def acquire_lock():
-    """
-    Защищает от двух процессов бота в одном контейнере.
-    Не предотвращает запуск бота на другом сервисе или компьютере.
-    """
     global _LOCK_FD
 
     lock_fd = open(LOCK_FILE, "a+")
@@ -103,7 +96,6 @@ def acquire_lock():
     lock_fd.write(str(os.getpid()))
     lock_fd.flush()
 
-    # Держим дескриптор открытым всё время работы процесса.
     _LOCK_FD = lock_fd
 
 
@@ -443,7 +435,6 @@ async def fetch_fresh_from_feed(
     feed_url: str,
     semaphore: asyncio.Semaphore,
 ):
-    """Проверяет одну ленту и возвращает подходящие новые записи."""
     async with semaphore:
         try:
             feed = await asyncio.wait_for(
@@ -491,7 +482,6 @@ async def fetch_fresh_from_feed(
 
 
 async def find_one_new_entry():
-    """Параллельно проверяет RSS и возвращает первую найденную новость."""
     feeds = list(RSS_FEEDS)
     random.shuffle(feeds)
 
@@ -553,7 +543,7 @@ def rewrite_with_ai(title: str, summary: str):
 - Дружелюбный и спокойный, немного серьёзнее обычного развлекательного поста.
 - Без навязчивого сленга, кликбейта и громких неподтверждённых заявлений.
 - Пиши естественно, простыми словами.
-- На русском языке
+- На русском языке.
 
 Формат:
 - 2–3 законченных предложения.
@@ -589,14 +579,12 @@ def rewrite_with_ai(title: str, summary: str):
 
             print(f"ℹ️ Groq finish_reason={finish_reason}")
 
-            # Модель упёрлась в лимит токенов — пробуем ещё раз.
             if finish_reason == "length":
                 print("⚠️ Ответ Groq обрезан лимитом, повторяю запрос.")
                 continue
 
             text = re.sub(r"https?://\S+", "", text).strip()
 
-            # Если модель оборвала фразу, повторяем запрос один раз.
             if not text or text[-1] not in ".!?…»”":
                 print(f"⚠️ Groq вернул незавершённый текст: {text[-120:]}")
                 continue
@@ -666,7 +654,6 @@ async def find_and_send_next(
         raw_summary = getattr(entry, "summary", "") or ""
         image_url = extract_image(entry, raw_summary)
 
-        # Не блокируем event loop во время синхронного запроса к Groq.
         post_text = await asyncio.to_thread(
             rewrite_with_ai,
             title,
@@ -876,52 +863,6 @@ async def review_callback(
 # Фоновые задачи
 # ============================================================
 
-async def auto_publish_loop(app: Application):
-    """Автопубликует посты, ожидающие решения дольше заданного времени."""
-    while True:
-        try:
-            now = time.time()
-
-            for review_id, item in list(pending_queue.items()):
-                try:
-                    created_at = float(item.get("created_at", now))
-                except (TypeError, ValueError):
-                    created_at = now
-
-                if now - created_at < AUTO_PUBLISH_MINUTES * 60:
-                    continue
-
-                try:
-                    await publish_to_channel(app, item)
-
-                    pending_queue.pop(review_id, None)
-                    bump_stat("published")
-                    await save_data()
-
-                    await app.bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=(
-                            "⏰ Автопубликация выполнена: "
-                            f"{item.get('title', '')[:100]}"
-                        ),
-                    )
-                    print(f"⏰ Автопубликация: {item.get('title', '')}")
-
-                except Exception as exc:
-                    print(
-                        f"❌ Ошибка автопубликации: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-        except Exception as exc:
-            print(
-                f"❌ Ошибка фоновой проверки: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-        await asyncio.sleep(30)
-
-
 async def schedule_loop(app: Application):
     """Плановый поиск в заданные часы с учётом TIMEZONE."""
     while True:
@@ -1011,14 +952,9 @@ async def main():
         if application.updater is None:
             raise RuntimeError("У Telegram Application отсутствует Updater")
 
-        # Один polling-запуск для этого токена.
         await application.updater.start_polling()
 
         background_tasks = [
-            asyncio.create_task(
-                auto_publish_loop(application),
-                name="auto-publish",
-            ),
             asyncio.create_task(
                 schedule_loop(application),
                 name="schedule",
