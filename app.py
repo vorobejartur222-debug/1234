@@ -58,13 +58,13 @@ try:
 except ZoneInfoNotFoundError as exc:
     raise RuntimeError(f"Неизвестная временная зона: {TIMEZONE_NAME}") from exc
 
-# Ускоряем: больше параллельных лент, меньше таймауты, меньше записей на ленту
 MAX_PARALLEL_FEEDS = 13
 FEED_CONNECT_TIMEOUT = 2
 FEED_READ_TIMEOUT = 4
 FEED_TOTAL_TIMEOUT = 6
 MAX_ENTRIES_PER_FEED = 10
 MAX_ATTEMPTS = 3
+FIND_TOTAL_TIMEOUT = 45  # максимум на весь поиск одной новости
 
 SCHEDULE_HOURS = {10, 14, 18, 22}
 
@@ -143,6 +143,8 @@ def fresh_default_data():
 _data = fresh_default_data()
 _data_sha = None
 _data_lock = asyncio.Lock()
+_find_lock = asyncio.Lock()          # защита от параллельных поисков
+_seen_set = set()                    # быстрый доступ к seen
 pending_queue = _data["pending"]
 
 GH_HEADERS = {
@@ -160,7 +162,7 @@ GITHUB_CONTENTS_URL = (
 
 
 def _load_sync():
-    global _data, _data_sha, pending_queue
+    global _data, _data_sha, pending_queue, _seen_set
 
     try:
         response = requests.get(
@@ -215,6 +217,7 @@ def _load_sync():
         _data_sha = None
 
     pending_queue = _data["pending"]
+    _seen_set = set(_data.get("items", []))
 
     print(
         f"💾 Загружено: {len(_data['items'])} items, "
@@ -305,7 +308,7 @@ async def save_data():
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(_save_sync),
-                timeout=30,
+                timeout=15,
             )
         except asyncio.TimeoutError:
             print("⚠️ Тайм-аут сохранения данных в GitHub.")
@@ -313,17 +316,23 @@ async def save_data():
 
 
 def is_seen(key: str) -> bool:
-    return key in _data.get("items", [])
+    return key in _seen_set
 
 
 def mark_seen(key: str):
-    items = _data.setdefault("items", [])
+    if key in _seen_set:
+        return
 
-    if key not in items:
-        items.append(key)
+    _seen_set.add(key)
+
+    items = _data.setdefault("items", [])
+    items.append(key)
 
     if len(items) > 2000:
+        removed = items[:-2000]
         _data["items"] = items[-2000:]
+        for old_key in removed:
+            _seen_set.discard(old_key)
 
 
 def bump_stat(stat_name: str):
@@ -449,7 +458,6 @@ async def fetch_fresh_from_feed(
 
             fresh = []
 
-            # Ограничиваем число записей — ускоряет в разы
             for entry in feed.entries[:MAX_ENTRIES_PER_FEED]:
                 title = (
                     clean_html(getattr(entry, "title", "") or "")
@@ -515,7 +523,6 @@ async def find_one_new_entry():
                     continue
 
                 if fresh:
-                    # Отменяем все оставшиеся задачи — экономим время
                     for pending_task in tasks:
                         pending_task.cancel()
 
@@ -642,11 +649,11 @@ async def safe_edit(query, text: str):
             print(f"⚠️ Не удалось изменить сообщение: {exc}")
 
 
-async def find_and_send_next(
-    app: Application,
-    max_attempts: int = MAX_ATTEMPTS,
-):
-    for _ in range(max_attempts):
+async def _find_and_send_next_inner(app: Application, max_attempts: int):
+    """Внутренняя реализация поиска и отправки админу."""
+    for attempt in range(1, max_attempts + 1):
+        print(f"🔎 Попытка {attempt}/{max_attempts}")
+
         candidate = await find_one_new_entry()
 
         if not candidate:
@@ -671,7 +678,7 @@ async def find_and_send_next(
         )
 
         if not post_text:
-            print(f"⏭️ Не удалось подготовить пост: {title[:80]}")
+            print(f"⏭️ AI не справился: {title[:80]}")
             mark_seen(candidate["key"])
             bump_stat("skipped")
             await save_data()
@@ -727,6 +734,33 @@ async def find_and_send_next(
     return False
 
 
+async def find_and_send_next(
+    app: Application,
+    max_attempts: int = MAX_ATTEMPTS,
+):
+    """Обёртка с защитой от параллельных вызовов и общим таймаутом."""
+    if _find_lock.locked():
+        print("⚠️ Поиск уже идёт, пропускаю вызов.")
+        return False
+
+    try:
+        async with _find_lock:
+            return await asyncio.wait_for(
+                _find_and_send_next_inner(app, max_attempts),
+                timeout=FIND_TOTAL_TIMEOUT,
+            )
+    except asyncio.TimeoutError:
+        print("⏱️ Общий таймаут поиска. Прерываю.")
+        try:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="⏱️ Поиск занял слишком много времени. Попробуй ещё раз.",
+            )
+        except Exception:
+            pass
+        return False
+
+
 async def publish_to_channel(app: Application, item: dict):
     post_text = item["post_text"]
     image_url = item.get("image_url")
@@ -761,6 +795,7 @@ async def start_command(
     await update.effective_message.reply_text(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
+        "/now — то же, что /next\n"
         "/stats — статистика\n"
         "/help — список команд"
     )
@@ -775,6 +810,7 @@ async def help_command(
 
     await update.effective_message.reply_text(
         "/next — найти следующую публикацию\n"
+        "/now — то же, что /next\n"
         "/stats — показать статистику\n"
         "/help — помощь\n\n"
         "Публикуйте или пропускайте пост кнопками под сообщением."
@@ -789,7 +825,15 @@ async def next_command(
         return
 
     await update.effective_message.reply_text("🔎 Ищу материал...")
-    await find_and_send_next(context.application)
+    asyncio.create_task(find_and_send_next(context.application))
+
+
+async def now_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Алиас /next."""
+    await next_command(update, context)
 
 
 async def stats_command(
@@ -847,7 +891,8 @@ async def review_callback(
         await save_data()
 
         await safe_edit(query, "⏭️ Пропущено. Ищу следующий материал...")
-        await find_and_send_next(context.application)
+        # Не блокируем обработку callback
+        asyncio.create_task(find_and_send_next(context.application))
         return
 
     if action != "publish":
@@ -921,6 +966,7 @@ async def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("next", next_command))
+    application.add_handler(CommandHandler("now", now_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(review_callback))
     application.add_error_handler(error_handler)
