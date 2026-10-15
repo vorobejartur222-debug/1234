@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,14 +21,8 @@ import requests
 from flask import Flask
 from groq import Groq
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from werkzeug.serving import make_server
-
 
 # ============================================================
 # Настройки
@@ -40,7 +34,6 @@ def required_env(name: str) -> str:
         raise RuntimeError(f"Не задана переменная окружения {name}")
     return value
 
-
 TELEGRAM_TOKEN = required_env("TELEGRAM_TOKEN")
 CHANNEL_ID = required_env("CHANNEL_ID")
 ADMIN_ID = int(required_env("ADMIN_ID"))
@@ -50,7 +43,8 @@ GITHUB_REPO = required_env("GITHUB_REPO")
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json").strip()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+# Заменил дефолт на реальный быстрый модель Groq. Если нужна другая, укажи в .env
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama3-8b-8192").strip()
 
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "UTC").strip()
 try:
@@ -59,12 +53,10 @@ except ZoneInfoNotFoundError as exc:
     raise RuntimeError(f"Неизвестная временная зона: {TIMEZONE_NAME}") from exc
 
 MAX_PARALLEL_FEEDS = 13
-FEED_CONNECT_TIMEOUT = 2
-FEED_READ_TIMEOUT = 4
 FEED_TOTAL_TIMEOUT = 6
 MAX_ENTRIES_PER_FEED = 10
 MAX_ATTEMPTS = 3
-FIND_TOTAL_TIMEOUT = 45  # максимум на весь поиск одной новости
+FIND_TOTAL_TIMEOUT = 45
 
 SCHEDULE_HOURS = {10, 14, 18, 22}
 
@@ -73,55 +65,34 @@ if "/" not in GITHUB_REPO:
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-
 # ============================================================
-# Защита от двойного запуска внутри одного контейнера
+# Защита от двойного запуска
 # ============================================================
 
 LOCK_FILE = "/tmp/bot.lock"
 _LOCK_FD = None
 
-
 def acquire_lock():
     global _LOCK_FD
-
-    lock_fd = open(LOCK_FILE, "a+")
-
+    _LOCK_FD = open(LOCK_FILE, "a+")
     try:
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(_LOCK_FD.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
-        lock_fd.close()
+        _LOCK_FD.close()
         print("⚠️ Бот уже запущен в этом контейнере.")
         sys.exit(1)
 
-    lock_fd.seek(0)
-    lock_fd.truncate()
-    lock_fd.write(str(os.getpid()))
-    lock_fd.flush()
+    _LOCK_FD.seek(0)
+    _LOCK_FD.truncate()
+    _LOCK_FD.write(str(os.getpid()))
+    _LOCK_FD.flush()
 
-    _LOCK_FD = lock_fd
-
-
-# ============================================================
-# RSS-источники
-# ============================================================
-
-RSS_FEEDS = [
-    "https://nplus1.ru/rss",
-    "https://naked-science.ru/feed",
-    "https://www.ixbt.com/export/news.rss",
-    "https://hi-news.ru/feed/",
-    "https://tproger.ru/feed/",
-    "https://the-flow.ru/rss/",
-    "https://www.sports.ru/rss/all.xml",
-    "https://kulturomania.ru/rss/",
-    "https://positime.ru/rss/",
-    "https://www.positive.news/feed/",
-    "https://www.optimistdaily.com/feed/",
-    "http://www.gazeta.ru/export/rss/autonews.xml",
-    "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
-]
-
+def release_lock():
+    global _LOCK_FD
+    if _LOCK_FD:
+        fcntl.flock(_LOCK_FD.fileno(), fcntl.LOCK_UN)
+        _LOCK_FD.close()
+        _LOCK_FD = None
 
 # ============================================================
 # Данные и GitHub-хранилище
@@ -131,20 +102,15 @@ def fresh_default_data():
     return {
         "items": [],
         "pending": {},
-        "stats": {
-            "published": 0,
-            "skipped": 0,
-            "sources": {},
-        },
+        "stats": {"published": 0, "skipped": 0, "sources": {}},
         "last_schedule_slot": "",
     }
-
 
 _data = fresh_default_data()
 _data_sha = None
 _data_lock = asyncio.Lock()
-_find_lock = asyncio.Lock()          # защита от параллельных поисков
-_seen_set = set()                    # быстрый доступ к seen
+_find_lock = asyncio.Lock()
+_seen_set = set()
 pending_queue = _data["pending"]
 
 GH_HEADERS = {
@@ -155,209 +121,126 @@ GH_HEADERS = {
 
 _encoded_repo = quote(GITHUB_REPO, safe="/")
 _encoded_data_file = quote(GITHUB_DATA_FILE, safe="/")
-GITHUB_CONTENTS_URL = (
-    f"https://api.github.com/repos/{_encoded_repo}"
-    f"/contents/{_encoded_data_file}"
-)
-
+GITHUB_CONTENTS_URL = f"https://api.github.com/repos/{_encoded_repo}/contents/{_encoded_data_file}"
 
 def _load_sync():
     global _data, _data_sha, pending_queue, _seen_set
-
     try:
-        response = requests.get(
-            GITHUB_CONTENTS_URL,
-            headers=GH_HEADERS,
-            timeout=15,
-        )
-
+        response = requests.get(GITHUB_CONTENTS_URL, headers=GH_HEADERS, timeout=15)
         if response.status_code == 404:
-            print("ℹ️ Файл данных GitHub не найден; он будет создан при сохранении.")
+            print("ℹ️ Файл данных GitHub не найден; будет создан при сохранении.")
             _data = fresh_default_data()
             _data_sha = None
-
         elif response.status_code != 200:
-            print(
-                f"⚠️ GitHub GET {response.status_code}: "
-                f"{response.text[:300]}"
-            )
+            print(f"⚠️ GitHub GET {response.status_code}: {response.text[:200]}")
             _data = fresh_default_data()
             _data_sha = None
-
         else:
             payload = response.json()
             file_content = base64.b64decode(payload["content"]).decode("utf-8")
             loaded = json.loads(file_content)
-
+            
             _data = fresh_default_data()
             _data.update(loaded)
-
-            if not isinstance(_data.get("items"), list):
-                _data["items"] = []
-
-            if not isinstance(_data.get("pending"), dict):
-                _data["pending"] = {}
-
-            if not isinstance(_data.get("stats"), dict):
-                _data["stats"] = fresh_default_data()["stats"]
-
+            
+            # Гарантируем корректность типов
+            if not isinstance(_data.get("items"), list): _data["items"] = []
+            if not isinstance(_data.get("pending"), dict): _data["pending"] = {}
+            if not isinstance(_data.get("stats"), dict): _data["stats"] = fresh_default_data()["stats"]
+            
             _data["stats"].setdefault("published", 0)
             _data["stats"].setdefault("skipped", 0)
             _data["stats"].setdefault("sources", {})
             _data.setdefault("last_schedule_slot", "")
-
             _data_sha = payload.get("sha")
-
     except Exception as exc:
-        print(
-            f"❌ Ошибка загрузки данных из GitHub: "
-            f"{type(exc).__name__}: {exc}"
-        )
+        print(f"❌ Ошибка загрузки данных из GitHub: {type(exc).__name__}: {exc}")
         _data = fresh_default_data()
         _data_sha = None
 
     pending_queue = _data["pending"]
     _seen_set = set(_data.get("items", []))
-
-    print(
-        f"💾 Загружено: {len(_data['items'])} items, "
-        f"{len(pending_queue)} pending"
-    )
+    print(f"💾 Загружено: {len(_data['items'])} items, {len(pending_queue)} pending")
     return _data
-
 
 def _save_sync():
     global _data_sha
-
     _data["pending"] = pending_queue
-
     for attempt in range(3):
         try:
-            content = json.dumps(
-                _data,
-                ensure_ascii=False,
-                indent=2,
-            )
-
+            content = json.dumps(_data, ensure_ascii=False, indent=2)
             payload = {
-                "message": (
-                    "Update bot data "
-                    f"{datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC"
-                ),
-                "content": base64.b64encode(
-                    content.encode("utf-8")
-                ).decode("ascii"),
-                "committer": {
-                    "name": "News Bot",
-                    "email": "bot@example.com",
-                },
+                "message": f"Update bot data {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
+                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                "committer": {"name": "News Bot", "email": "bot@example.com"},
             }
-
             if _data_sha:
                 payload["sha"] = _data_sha
 
-            response = requests.put(
-                GITHUB_CONTENTS_URL,
-                headers=GH_HEADERS,
-                json=payload,
-                timeout=20,
-            )
-
+            response = requests.put(GITHUB_CONTENTS_URL, headers=GH_HEADERS, json=payload, timeout=20)
             if response.status_code in (200, 201):
                 _data_sha = response.json().get("content", {}).get("sha")
                 return True
-
             if response.status_code == 409 and attempt < 2:
-                current = requests.get(
-                    GITHUB_CONTENTS_URL,
-                    headers=GH_HEADERS,
-                    timeout=15,
-                )
-
+                current = requests.get(GITHUB_CONTENTS_URL, headers=GH_HEADERS, timeout=15)
                 if current.status_code == 200:
                     _data_sha = current.json().get("sha")
                     continue
-
                 if current.status_code == 404:
                     _data_sha = None
                     continue
-
-            print(
-                f"⚠️ GitHub PUT {response.status_code}: "
-                f"{response.text[:300]}"
-            )
+            print(f"⚠️ GitHub PUT {response.status_code}: {response.text[:200]}")
             return False
-
         except Exception as exc:
-            print(
-                f"❌ Ошибка сохранения в GitHub: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            print(f"❌ Ошибка сохранения в GitHub: {type(exc).__name__}: {exc}")
             return False
-
     return False
-
 
 async def load_data():
     async with _data_lock:
         return await asyncio.to_thread(_load_sync)
 
-
 async def save_data():
     async with _data_lock:
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(_save_sync),
-                timeout=15,
-            )
+            return await asyncio.wait_for(asyncio.to_thread(_save_sync), timeout=15)
         except asyncio.TimeoutError:
             print("⚠️ Тайм-аут сохранения данных в GitHub.")
             return False
 
-
 def is_seen(key: str) -> bool:
     return key in _seen_set
-
 
 def mark_seen(key: str):
     if key in _seen_set:
         return
-
     _seen_set.add(key)
-
     items = _data.setdefault("items", [])
     items.append(key)
-
     if len(items) > 2000:
         removed = items[:-2000]
         _data["items"] = items[-2000:]
         for old_key in removed:
             _seen_set.discard(old_key)
 
-
 def bump_stat(stat_name: str):
     stats = _data.setdefault("stats", fresh_default_data()["stats"])
     stats[stat_name] = stats.get(stat_name, 0) + 1
-
 
 def bump_source(feed_url: str):
     stats = _data.setdefault("stats", fresh_default_data()["stats"])
     sources = stats.setdefault("sources", {})
     sources[feed_url] = sources.get(feed_url, 0) + 1
 
-
 # ============================================================
 # Flask health-check для Render
 # ============================================================
-
 flask_app = Flask(__name__)
-
 
 @flask_app.route("/")
 @flask_app.route("/health")
 def health():
     return "OK", 200
-
 
 # ============================================================
 # RSS: обработка и фильтр
@@ -366,180 +249,103 @@ def health():
 def clean_html(raw: str) -> str:
     if not raw:
         return ""
-
     text = re.sub(r"<[^>]*>", " ", raw)
     text = html.unescape(text)
     text = re.sub(r"https?://\S+", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
-
 def get_summary(entry) -> str:
     summary = getattr(entry, "summary", "") or ""
-
     if not summary:
         contents = getattr(entry, "content", None) or []
         if contents:
             summary = contents[0].get("value", "")
-
     return clean_html(summary)[:1200]
 
-
 def get_item_key(entry, feed_url: str, title: str) -> str:
-    source_id = (
-        getattr(entry, "id", None)
-        or getattr(entry, "link", None)
-        or f"{feed_url}:{title}"
-    )
+    source_id = getattr(entry, "id", None) or getattr(entry, "link", None) or f"{feed_url}:{title}"
     return hashlib.sha256(str(source_id).encode("utf-8")).hexdigest()
-
 
 def extract_image(entry, raw_summary: str = ""):
     for field in ("media_content", "media_thumbnail"):
         for media in getattr(entry, field, None) or []:
             if media.get("url"):
                 return media["url"]
-
     for enclosure in getattr(entry, "enclosures", None) or []:
         if "image" in enclosure.get("type", "") and enclosure.get("href"):
             return enclosure["href"]
-
-    match = re.search(
-        r"""<img[^>]+src=["']([^"']+)["']""",
-        raw_summary or "",
-        re.IGNORECASE,
-    )
+    match = re.search(r"""<img[^>]+src=["']([^"']+)["']""", raw_summary or "", re.IGNORECASE)
     return match.group(1) if match else None
 
-
 BLOCK_MARKERS = [
-    "туториал",
-    "руководство",
-    "как я ",
-    "как сделать",
-    "how to",
-    "tutorial",
-    "война",
-    "убит",
-    "погиб",
-    "теракт",
-    "катастрофа",
-    "трагедия",
-    "авария",
-    "смерть",
-    "умер",
+    "туториал", "руководство", "как я ", "как сделать", "how to", "tutorial",
+    "война", "убит", "погиб", "теракт", "катастрофа", "трагедия", "авария", "смерть", "умер",
 ]
-
 
 def is_news_item(title: str, summary: str) -> bool:
     text = f"{title} {summary}".lower()
     return not any(marker in text for marker in BLOCK_MARKERS)
 
-
 def parse_feed_sync(feed_url: str):
     response = requests.get(
         feed_url,
         headers={"User-Agent": "VibeNewsBot/1.0"},
-        timeout=(FEED_CONNECT_TIMEOUT, FEED_READ_TIMEOUT),
+        timeout=(2, 4) # CONNECT, READ
     )
     response.raise_for_status()
     return feedparser.parse(response.content)
 
-
-async def fetch_fresh_from_feed(
-    feed_url: str,
-    semaphore: asyncio.Semaphore,
-):
+async def fetch_fresh_from_feed(feed_url: str, semaphore: asyncio.Semaphore):
     async with semaphore:
         try:
             feed = await asyncio.wait_for(
                 asyncio.to_thread(parse_feed_sync, feed_url),
                 timeout=FEED_TOTAL_TIMEOUT,
             )
-
             fresh = []
-
             for entry in feed.entries[:MAX_ENTRIES_PER_FEED]:
-                title = (
-                    clean_html(getattr(entry, "title", "") or "")
-                    or "Без заголовка"
-                )
+                title = clean_html(getattr(entry, "title", "") or "") or "Без заголовка"
                 key = get_item_key(entry, feed_url, title)
-
                 if is_seen(key):
                     continue
-
                 summary = get_summary(entry)
-
                 if not is_news_item(title, summary):
                     mark_seen(key)
                     continue
-
-                fresh.append({
-                    "entry": entry,
-                    "title": title,
-                    "feed_url": feed_url,
-                    "key": key,
-                })
-
+                fresh.append({"entry": entry, "title": title, "feed_url": feed_url, "key": key})
             return fresh
-
         except asyncio.TimeoutError:
-            print(f"⏱️ Тайм-аут RSS: {feed_url}")
-
+            pass # Тихий тайм-аут для скорости
         except Exception as exc:
-            print(
-                f"⚠️ Ошибка RSS {feed_url}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
+            print(f"⚠️ Ошибка RSS {feed_url}: {type(exc).__name__}")
         return []
-
 
 async def find_one_new_entry():
     feeds = list(RSS_FEEDS)
     random.shuffle(feeds)
-
     semaphore = asyncio.Semaphore(MAX_PARALLEL_FEEDS)
-    tasks = {
-        asyncio.create_task(fetch_fresh_from_feed(url, semaphore))
-        for url in feeds
-    }
+    tasks = [asyncio.create_task(fetch_fresh_from_feed(url, semaphore)) for url in feeds]
 
     try:
         while tasks:
-            done, tasks = await asyncio.wait(
-                tasks,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
+            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 try:
                     fresh = task.result()
-                except Exception as exc:
-                    print(
-                        f"⚠️ Ошибка задачи RSS: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                except Exception:
                     continue
-
                 if fresh:
-                    for pending_task in tasks:
-                        pending_task.cancel()
-
-                    if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
-
+                    # Отменяем остальные задачи, так как мы уже нашли кандидат
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
                     return random.choice(fresh)
-
+        return None
+    except asyncio.CancelledError:
         return None
 
-    finally:
-        for task in tasks:
-            task.cancel()
-
-
 # ============================================================
-# Groq: генерация законченного текста
+# Groq: генерация
 # ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
@@ -552,7 +358,6 @@ def rewrite_with_ai(title: str, summary: str):
 
 Главная задача:
 - Рассказывай только об одном событии.
-- Если заголовок или описание упоминает несколько событий, выбери главное событие из заголовка и не смешивай его с остальными.
 - Излагай мысль последовательно: что произошло и, если это прямо указано в источнике, почему это важно.
 - Используй только факты из предоставленных материалов. Ничего не выдумывай.
 
@@ -560,7 +365,6 @@ def rewrite_with_ai(title: str, summary: str):
 - Дружелюбный и спокойный, немного серьёзнее обычного развлекательного поста.
 - Без навязчивого сленга, кликбейта и громких неподтверждённых заявлений.
 - Пиши естественно, простыми словами.
-- На русском языке.
 
 Формат:
 - 2–3 законченных предложения.
@@ -577,7 +381,7 @@ def rewrite_with_ai(title: str, summary: str):
 
 Напиши только готовый пост:"""
 
-    for attempt in range(2):
+    for _ in range(2):
         try:
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
@@ -585,42 +389,28 @@ def rewrite_with_ai(title: str, summary: str):
                 temperature=0.5,
                 max_tokens=500,
             )
-
             if not response.choices:
-                print("⚠️ Groq вернул пустой ответ.")
                 continue
 
             choice = response.choices[0]
             text = (choice.message.content or "").strip()
-            finish_reason = getattr(choice, "finish_reason", None)
-
-            print(f"ℹ️ Groq finish_reason={finish_reason}")
-
-            if finish_reason == "length":
-                print("⚠️ Ответ Groq обрезан лимитом, повторяю запрос.")
+            
+            if getattr(choice, "finish_reason", None) == "length":
                 continue
 
             text = re.sub(r"https?://\S+", "", text).strip()
-
             if not text or text[-1] not in ".!?…»”":
-                print(f"⚠️ Groq вернул незавершённый текст: {text[-120:]}")
                 continue
-
             if len(text) > 700:
                 text = text[:697].rsplit(" ", 1)[0].rstrip() + "..."
-
             if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", text)) < 10:
-                print("⚠️ Ответ Groq слишком короткий или некорректный.")
                 continue
 
             return text
-
         except Exception as exc:
             print(f"❌ Groq: {type(exc).__name__}: {exc}")
             return None
-
     return None
-
 
 # ============================================================
 # Telegram: отправка и модерация
@@ -628,16 +418,9 @@ def rewrite_with_ai(title: str, summary: str):
 
 def build_keyboard(review_id: str):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🚀 Опубликовать",
-            callback_data=f"publish:{review_id}",
-        ),
-        InlineKeyboardButton(
-            "⏭️ Дальше",
-            callback_data=f"skip:{review_id}",
-        ),
+        InlineKeyboardButton("🚀 Опубликовать", callback_data=f"publish:{review_id}"),
+        InlineKeyboardButton("⏭️ Дальше", callback_data=f"skip:{review_id}"),
     ]])
-
 
 async def safe_edit(query, text: str):
     try:
@@ -645,22 +428,16 @@ async def safe_edit(query, text: str):
     except Exception:
         try:
             await query.edit_message_caption(caption=text)
-        except Exception as exc:
-            print(f"⚠️ Не удалось изменить сообщение: {exc}")
-
+        except Exception:
+            pass
 
 async def _find_and_send_next_inner(app: Application, max_attempts: int):
-    """Внутренняя реализация поиска и отправки админу."""
     for attempt in range(1, max_attempts + 1):
         print(f"🔎 Попытка {attempt}/{max_attempts}")
-
         candidate = await find_one_new_entry()
 
         if not candidate:
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="😔 Новых подходящих публикаций не нашёл.",
-            )
+            await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Новых подходящих публикаций не нашёл.")
             await save_data()
             return False
 
@@ -671,14 +448,9 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         raw_summary = getattr(entry, "summary", "") or ""
         image_url = extract_image(entry, raw_summary)
 
-        post_text = await asyncio.to_thread(
-            rewrite_with_ai,
-            title,
-            summary,
-        )
+        post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
         if not post_text:
-            print(f"⏭️ AI не справился: {title[:80]}")
             mark_seen(candidate["key"])
             bump_stat("skipped")
             await save_data()
@@ -689,77 +461,43 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
 
         review_id = uuid.uuid4().hex[:8]
         pending_queue[review_id] = {
-            "title": title,
-            "post_text": post_text,
-            "image_url": image_url,
-            "source_url": source_url,
-            "created_at": time.time(),
+            "title": title, "post_text": post_text,
+            "image_url": image_url, "source_url": source_url, "created_at": time.time(),
         }
-
         await save_data()
 
         message_text = f"📬 Пост на проверку\n\n{post_text}"
         keyboard = build_keyboard(review_id)
 
         try:
-            if image_url:
-                await app.bot.send_photo(
-                    chat_id=ADMIN_ID,
-                    photo=image_url,
-                    caption=message_text[:1024],
-                    reply_markup=keyboard,
-                )
+            if image_url and len(post_text) <= 1024:
+                await app.bot.send_photo(chat_id=ADMIN_ID, photo=image_url, caption=message_text, reply_markup=keyboard)
             else:
-                await app.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=message_text[:4096],
-                    reply_markup=keyboard,
-                )
-
+                await app.bot.send_message(chat_id=ADMIN_ID, text=message_text[:4096], reply_markup=keyboard)
         except Exception as exc:
             print(f"⚠️ Не удалось отправить фото, отправляю текст: {exc}")
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=message_text[:4096],
-                reply_markup=keyboard,
-            )
+            await app.bot.send_message(chat_id=ADMIN_ID, text=message_text[:4096], reply_markup=keyboard)
 
-        print(f"📩 Отправлено админу на проверку: {title}")
         return True
 
-    await app.bot.send_message(
-        chat_id=ADMIN_ID,
-        text="😔 Не получилось подготовить пост из найденных материалов.",
-    )
+    await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Не получилось подготовить пост из найденных материалов.")
     return False
 
-
-async def find_and_send_next(
-    app: Application,
-    max_attempts: int = MAX_ATTEMPTS,
-):
-    """Обёртка с защитой от параллельных вызовов и общим таймаутом."""
+async def find_and_send_next(app: Application, max_attempts: int = MAX_ATTEMPTS):
     if _find_lock.locked():
         print("⚠️ Поиск уже идёт, пропускаю вызов.")
         return False
 
     try:
         async with _find_lock:
-            return await asyncio.wait_for(
-                _find_and_send_next_inner(app, max_attempts),
-                timeout=FIND_TOTAL_TIMEOUT,
-            )
+            return await asyncio.wait_for(_find_and_send_next_inner(app, max_attempts), timeout=FIND_TOTAL_TIMEOUT)
     except asyncio.TimeoutError:
-        print("⏱️ Общий таймаут поиска. Прерываю.")
+        print("⏱️ Общий таймаут поиска.")
         try:
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="⏱️ Поиск занял слишком много времени. Попробуй ещё раз.",
-            )
+            await app.bot.send_message(chat_id=ADMIN_ID, text="⏱️ Поиск занял слишком много времени. Попробуй ещё раз.")
         except Exception:
             pass
         return False
-
 
 async def publish_to_channel(app: Application, item: dict):
     post_text = item["post_text"]
@@ -767,85 +505,46 @@ async def publish_to_channel(app: Application, item: dict):
 
     if image_url and len(post_text) <= 1024:
         try:
-            return await app.bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=image_url,
-                caption=post_text,
-            )
-        except Exception as exc:
-            print(f"⚠️ Не удалось отправить фото: {exc}")
-
-    return await app.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=post_text[:4096],
-    )
-
+            return await app.bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=post_text)
+        except Exception:
+            pass
+    return await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
 
 # ============================================================
 # Команды
 # ============================================================
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def require_admin(update: Update):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        return
+        return False
+    return True
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
     await update.effective_message.reply_text(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
-        "/now — то же, что /next\n"
         "/stats — статистика\n"
         "/help — список команд"
     )
 
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        return
-
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
     await update.effective_message.reply_text(
         "/next — найти следующую публикацию\n"
-        "/now — то же, что /next\n"
         "/stats — показать статистику\n"
-        "/help — помощь\n\n"
         "Публикуйте или пропускайте пост кнопками под сообщением."
     )
 
-
-async def next_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        return
-
+async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
     await update.effective_message.reply_text("🔎 Ищу материал...")
     asyncio.create_task(find_and_send_next(context.application))
 
-
-async def now_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    """Алиас /next."""
-    await next_command(update, context)
-
-
-async def stats_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.effective_user or update.effective_user.id != ADMIN_ID:
-        return
-
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
     stats = _data.get("stats", {})
     sources = stats.get("sources", {})
-
     await update.effective_message.reply_text(
         "📊 Статистика\n\n"
         f"Опубликовано: {stats.get('published', 0)}\n"
@@ -854,25 +553,13 @@ async def stats_command(
         f"Источников с публикациями: {len(sources)}"
     )
 
-
-async def review_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
-    if not query:
-        return
-
-    if not query.from_user or query.from_user.id != ADMIN_ID:
-        await query.answer(
-            "Эта кнопка доступна только администратору.",
-            show_alert=True,
-        )
+    if not query or not query.from_user or query.from_user.id != ADMIN_ID:
+        if query: await query.answer("Доступно только администратору.", show_alert=True)
         return
 
     await query.answer()
-
     try:
         action, review_id = query.data.split(":", 1)
     except (AttributeError, ValueError):
@@ -880,7 +567,6 @@ async def review_callback(
         return
 
     item = pending_queue.get(review_id)
-
     if not item:
         await safe_edit(query, "Эта публикация уже обработана.")
         return
@@ -889,101 +575,61 @@ async def review_callback(
         pending_queue.pop(review_id, None)
         bump_stat("skipped")
         await save_data()
-
         await safe_edit(query, "⏭️ Пропущено. Ищу следующий материал...")
-        # Не блокируем обработку callback
         asyncio.create_task(find_and_send_next(context.application))
         return
 
-    if action != "publish":
+    if action == "publish":
+        try:
+            await publish_to_channel(context.application, item)
+            pending_queue.pop(review_id, None)
+            bump_stat("published")
+            await save_data()
+            await safe_edit(query, f"✅ Опубликовано: {item['title'][:60]}")
+            print(f"✅ Опубликовано: {item['title']}")
+        except Exception as exc:
+            await safe_edit(query, "❌ Ошибка публикации. Подробности — в логах.")
+            print(f"❌ Ошибка публикации: {type(exc).__name__}: {exc}")
+    else:
         await safe_edit(query, "Неизвестное действие.")
-        return
-
-    try:
-        await publish_to_channel(context.application, item)
-
-        pending_queue.pop(review_id, None)
-        bump_stat("published")
-        await save_data()
-
-        await safe_edit(query, f"✅ Опубликовано: {item['title'][:60]}")
-        print(f"✅ Опубликовано: {item['title']}")
-
-    except Exception as exc:
-        await safe_edit(query, "❌ Ошибка публикации. Подробности — в логах.")
-        print(f"❌ Ошибка публикации: {type(exc).__name__}: {exc}")
-
 
 # ============================================================
-# Фоновые задачи
+# Фоновые задачи и Запуск
 # ============================================================
 
 async def schedule_loop(app: Application):
     while True:
         try:
             now = datetime.now(LOCAL_TZ)
-
             if now.hour in SCHEDULE_HOURS:
                 slot = now.strftime("%Y-%m-%d-%H")
-
                 if _data.get("last_schedule_slot") != slot:
                     _data["last_schedule_slot"] = slot
                     await save_data()
-
                     print(f"🕒 Плановый поиск, слот {slot}")
                     await find_and_send_next(app)
-
         except Exception as exc:
-            print(
-                f"❌ Ошибка расписания: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
+            print(f"❌ Ошибка расписания: {type(exc).__name__}: {exc}")
         await asyncio.sleep(30)
 
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"❌ Ошибка Telegram: {context.error}")
-
-
-# ============================================================
-# Запуск
-# ============================================================
 
 async def main():
     acquire_lock()
     await load_data()
 
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("next", next_command))
-    application.add_handler(CommandHandler("now", now_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(review_callback))
     application.add_error_handler(error_handler)
 
     port = int(os.environ.get("PORT", "10000"))
-
-    http_server = make_server(
-        "0.0.0.0",
-        port,
-        flask_app,
-        threaded=True,
-    )
-    http_thread = threading.Thread(
-        target=http_server.serve_forever,
-        name="health-server",
-        daemon=True,
-    )
+    http_server = make_server("0.0.0.0", port, flask_app, threaded=True)
+    http_thread = threading.Thread(target=http_server.serve_forever, name="health-server", daemon=True)
     http_thread.start()
 
     loop = asyncio.get_running_loop()
@@ -993,55 +639,38 @@ async def main():
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
-            signal.signal(
-                sig,
-                lambda *_: loop.call_soon_threadsafe(stop_event.set),
-            )
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop_event.set))
 
     background_tasks = []
-
     try:
         await application.initialize()
         await application.start()
-
         if application.updater is None:
             raise RuntimeError("У Telegram Application отсутствует Updater")
-
+        
         await application.updater.start_polling()
-
-        background_tasks = [
-            asyncio.create_task(
-                schedule_loop(application),
-                name="schedule",
-            ),
-        ]
-
+        background_tasks = [asyncio.create_task(schedule_loop(application), name="schedule")]
         print("✅ Бот запущен и готов к работе.")
+        
         await stop_event.wait()
-
     finally:
         print("🛑 Останавливаю приложение...")
-
         for task in background_tasks:
             task.cancel()
-
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
-
+        
         if application.updater and application.updater.running:
             await application.updater.stop()
-
         if application.running:
             await application.stop()
-
         await application.shutdown()
-
+        
         http_server.shutdown()
         http_server.server_close()
         http_thread.join(timeout=5)
-
+        release_lock()
         print("✅ Приложение остановлено.")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
