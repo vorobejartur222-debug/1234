@@ -39,11 +39,10 @@ CHANNEL_ID = required_env("CHANNEL_ID")
 ADMIN_ID = int(required_env("ADMIN_ID"))
 
 GITHUB_TOKEN = required_env("GITHUB_TOKEN")
-GITHUB_REPO = required_env("GITHUB_REPO")
+GITHUB_REPO = required_env("GITHUB_REPO").strip()
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json").strip()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-# Актуальная модель Groq (llama3-8b-8192 удалена из Groq)
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "UTC").strip()
@@ -57,6 +56,7 @@ FEED_TOTAL_TIMEOUT = 8
 MAX_ENTRIES_PER_FEED = 15
 MAX_ATTEMPTS = 5
 FIND_TOTAL_TIMEOUT = 60
+GROQ_TIMEOUT = 20
 
 SCHEDULE_HOURS = {10, 14, 18, 22}
 
@@ -98,7 +98,7 @@ def release_lock():
         _LOCK_FD = None
 
 # ============================================================
-# RSS-источники (убраны нерабочие)
+# RSS-источники
 # ============================================================
 
 RSS_FEEDS = [
@@ -112,8 +112,6 @@ RSS_FEEDS = [
     "https://www.optimistdaily.com/feed/",
     "http://www.gazeta.ru/export/rss/autonews.xml",
     "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
-    "https://lenta.ru/rss/news",
-    "https://ria.ru/export/rss2/archive/index.xml",
 ]
 
 # ============================================================
@@ -161,14 +159,14 @@ def _load_sync():
             payload = response.json()
             file_content = base64.b64decode(payload["content"]).decode("utf-8")
             loaded = json.loads(file_content)
-            
+
             _data = fresh_default_data()
             _data.update(loaded)
-            
+
             if not isinstance(_data.get("items"), list): _data["items"] = []
             if not isinstance(_data.get("pending"), dict): _data["pending"] = {}
             if not isinstance(_data.get("stats"), dict): _data["stats"] = fresh_default_data()["stats"]
-            
+
             _data["stats"].setdefault("published", 0)
             _data["stats"].setdefault("skipped", 0)
             _data["stats"].setdefault("sources", {})
@@ -195,19 +193,17 @@ def _save_sync():
                 "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
                 "committer": {"name": "News Bot", "email": "bot@example.com"},
             }
-            # sha нужен только для обновления существующего файла
             if _data_sha:
                 payload["sha"] = _data_sha
 
             response = requests.put(GITHUB_CONTENTS_URL, headers=GH_HEADERS, json=payload, timeout=20)
-            
+
             if response.status_code in (200, 201):
                 _data_sha = response.json().get("content", {}).get("sha")
                 print(f"✅ Данные сохранены в GitHub (sha: {_data_sha[:8]}...)")
                 return True
-            
+
             if response.status_code == 409 and attempt < 2:
-                # Конфликт версий — получаем актуальный sha
                 current = requests.get(GITHUB_CONTENTS_URL, headers=GH_HEADERS, timeout=15)
                 if current.status_code == 200:
                     _data_sha = current.json().get("sha")
@@ -215,19 +211,11 @@ def _save_sync():
                 if current.status_code == 404:
                     _data_sha = None
                     continue
-            
-            if response.status_code == 404 and not _data_sha:
-                # Файл не существует — пробуем создать через другой endpoint
-                print("⚠️ Файл не найден, пробуем создать через API...")
-                # Для создания нового файла PUT без sha должен работать
-                # Если не работает — проблема в правах токена
-                print(f"⚠️ GitHub PUT 404: возможно, токен не имеет прав на запись в репозиторий")
-                return False
-            
-            print(f"️ GitHub PUT {response.status_code}: {response.text[:200]}")
+
+            print(f"⚠️ GitHub PUT {response.status_code}: {response.text[:200]}")
             return False
         except Exception as exc:
-            print(f" Ошибка сохранения в GitHub: {type(exc).__name__}: {exc}")
+            print(f"❌ Ошибка сохранения в GitHub: {type(exc).__name__}: {exc}")
             return False
     return False
 
@@ -268,7 +256,6 @@ def bump_source(feed_url: str):
     sources[feed_url] = sources.get(feed_url, 0) + 1
 
 def reset_seen():
-    """Сбросить все увиденные новости (для тестирования)."""
     global _seen_set
     _seen_set.clear()
     _data["items"] = []
@@ -276,8 +263,9 @@ def reset_seen():
     print("🔄 Seen set сброшен")
 
 # ============================================================
-# Flask health-check для Render
+# Flask health-check
 # ============================================================
+
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -323,6 +311,8 @@ def extract_image(entry, raw_summary: str = ""):
 BLOCK_MARKERS = [
     "туториал", "руководство", "как я ", "как сделать", "how to", "tutorial",
     "война", "убит", "погиб", "теракт", "катастрофа", "трагедия", "авария", "смерть", "умер",
+    # политика (чтобы не забивать канал)
+    "путин", "зеленск", "трамп", "байден", "нато", "санкц", "кремл", "госдум", "минобороны",
 ]
 
 def is_news_item(title: str, summary: str) -> bool:
@@ -398,22 +388,22 @@ def rewrite_with_ai(title: str, summary: str):
     prompt = f"""Ты — редактор молодёжного Telegram-канала +VIBE NEWS.
 Напиши короткий, связный и содержательный пост на русском языке.
 
-Главная задача:
+ВАЖНО:
+- Если заголовок или описание на английском — ПЕРЕВЕДИ их на русский и напиши пост на русском.
 - Рассказывай только об одном событии.
-- Излагай мысль последовательно: что произошло и, если это прямо указано в источнике, почему это важно.
-- Используй только факты из предоставленных материалов. Ничего не выдумывай.
+- Используй только факты из материалов ниже. Ничего не выдумывай.
 
 Стиль:
-- Дружелюбный и спокойный, немного серьёзнее обычного развлекательного поста.
-- Без навязчивого сленга, кликбейта и громких неподтверждённых заявлений.
-- Пиши естественно, простыми словами.
+- Дружелюбный и спокойный, немного серьёзнее развлекательного.
+- Без навязчивого сленга и кликбейта.
+- Простые слова, естественные фразы.
 
 Формат:
 - 2–3 законченных предложения.
 - Не более 500 символов.
 - Начни с одного уместного эмодзи.
 - Закончи полной фразой с точкой.
-- Не добавляй ссылки, хэштеги, заголовок или комментарии о своей работе.
+- Без ссылок, хэштегов, заголовков.
 
 Заголовок источника:
 {title}
@@ -430,13 +420,14 @@ def rewrite_with_ai(title: str, summary: str):
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.5,
                 max_tokens=500,
+                timeout=GROQ_TIMEOUT,
             )
             if not response.choices:
                 continue
 
             choice = response.choices[0]
             text = (choice.message.content or "").strip()
-            
+
             if getattr(choice, "finish_reason", None) == "length":
                 continue
 
@@ -479,7 +470,10 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         candidate = await find_one_new_entry()
 
         if not candidate:
-            await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Новых подходящих публикаций не нашёл. Попробуй /reset и затем /next.")
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="😔 Новых подходящих публикаций не нашёл. Попробуй /reset и затем /next.",
+            )
             await save_data()
             return False
 
@@ -494,7 +488,7 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
         if not post_text:
-            print(f"️ AI не справился: {title[:80]}")
+            print(f"⏭️ AI не справился: {title[:80]}")
             mark_seen(candidate["key"])
             bump_stat("skipped")
             await save_data()
@@ -515,17 +509,29 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
 
         try:
             if image_url and len(post_text) <= 1024:
-                await app.bot.send_photo(chat_id=ADMIN_ID, photo=image_url, caption=message_text, reply_markup=keyboard)
+                await app.bot.send_photo(
+                    chat_id=ADMIN_ID, photo=image_url,
+                    caption=message_text, reply_markup=keyboard,
+                )
             else:
-                await app.bot.send_message(chat_id=ADMIN_ID, text=message_text[:4096], reply_markup=keyboard)
+                await app.bot.send_message(
+                    chat_id=ADMIN_ID, text=message_text[:4096],
+                    reply_markup=keyboard,
+                )
         except Exception as exc:
-            print(f"⚠️ Не удалось отправить фото, отправляю текст: {exc}")
-            await app.bot.send_message(chat_id=ADMIN_ID, text=message_text[:4096], reply_markup=keyboard)
+            print(f"⚠️ Не удалось отправить фото: {exc}")
+            await app.bot.send_message(
+                chat_id=ADMIN_ID, text=message_text[:4096],
+                reply_markup=keyboard,
+            )
 
         print(f"📩 Отправлено админу на проверку: {title}")
         return True
 
-    await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Не получилось подготовить пост из найденных материалов.")
+    await app.bot.send_message(
+        chat_id=ADMIN_ID,
+        text="😔 Не получилось подготовить пост из найденных материалов.",
+    )
     return False
 
 async def find_and_send_next(app: Application, max_attempts: int = MAX_ATTEMPTS):
@@ -535,11 +541,17 @@ async def find_and_send_next(app: Application, max_attempts: int = MAX_ATTEMPTS)
 
     try:
         async with _find_lock:
-            return await asyncio.wait_for(_find_and_send_next_inner(app, max_attempts), timeout=FIND_TOTAL_TIMEOUT)
+            return await asyncio.wait_for(
+                _find_and_send_next_inner(app, max_attempts),
+                timeout=FIND_TOTAL_TIMEOUT,
+            )
     except asyncio.TimeoutError:
         print("⏱️ Общий таймаут поиска.")
         try:
-            await app.bot.send_message(chat_id=ADMIN_ID, text="⏱️ Поиск занял слишком много времени. Попробуй ещё раз.")
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="⏱️ Поиск занял слишком много времени. Попробуй ещё раз.",
+            )
         except Exception:
             pass
         return False
@@ -550,7 +562,9 @@ async def publish_to_channel(app: Application, item: dict):
 
     if image_url and len(post_text) <= 1024:
         try:
-            return await app.bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=post_text)
+            return await app.bot.send_photo(
+                chat_id=CHANNEL_ID, photo=image_url, caption=post_text,
+            )
         except Exception:
             pass
     return await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
@@ -569,7 +583,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
-        "/reset — сбросить историю (для тестов)\n"
+        "/now — то же, что /next\n"
+        "/reset — сбросить историю\n"
         "/stats — статистика\n"
         "/help — список команд"
     )
@@ -578,7 +593,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     await update.effective_message.reply_text(
         "/next — найти следующую публикацию\n"
-        "/reset — сбросить seen set (все новости станут новыми)\n"
+        "/now — то же, что /next\n"
+        "/reset — сбросить seen set\n"
         "/stats — показать статистику\n"
         "Публикуйте или пропускайте пост кнопками под сообщением."
     )
@@ -588,10 +604,15 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("🔎 Ищу материал...")
     asyncio.create_task(find_and_send_next(context.application))
 
+async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await next_command(update, context)
+
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     reset_seen()
-    await update.effective_message.reply_text("🔄 История сброшена. Теперь /next найдёт свежие новости.")
+    await update.effective_message.reply_text(
+        "🔄 История сброшена. Теперь /next найдёт свежие новости."
+    )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
@@ -641,13 +662,13 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, f"✅ Опубликовано: {item['title'][:60]}")
             print(f"✅ Опубликовано: {item['title']}")
         except Exception as exc:
-            await safe_edit(query, "❌ Ошибка публикации. Подробности — в логах.")
+            await safe_edit(query, "❌ Ошибка публикации. Смотри логи.")
             print(f"❌ Ошибка публикации: {type(exc).__name__}: {exc}")
     else:
         await safe_edit(query, "Неизвестное действие.")
 
 # ============================================================
-# Фоновые задачи и Запуск
+# Фоновые задачи и запуск
 # ============================================================
 
 async def schedule_loop(app: Application):
@@ -672,15 +693,12 @@ async def main():
     acquire_lock()
     await load_data()
 
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-    
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("next", next_command))
+    application.add_handler(CommandHandler("now", now_command))
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(review_callback))
@@ -688,7 +706,9 @@ async def main():
 
     port = int(os.environ.get("PORT", "10000"))
     http_server = make_server("0.0.0.0", port, flask_app, threaded=True)
-    http_thread = threading.Thread(target=http_server.serve_forever, name="health-server", daemon=True)
+    http_thread = threading.Thread(
+        target=http_server.serve_forever, name="health-server", daemon=True,
+    )
     http_thread.start()
 
     loop = asyncio.get_running_loop()
@@ -706,14 +726,15 @@ async def main():
         await application.start()
         if application.updater is None:
             raise RuntimeError("У Telegram Application отсутствует Updater")
-        
-        # Небольшая задержка чтобы избежать конфликта с предыдущим инстансом
+
         await asyncio.sleep(2)
         await application.updater.start_polling(drop_pending_updates=True)
-        
-        background_tasks = [asyncio.create_task(schedule_loop(application), name="schedule")]
+
+        background_tasks = [
+            asyncio.create_task(schedule_loop(application), name="schedule"),
+        ]
         print("✅ Бот запущен и готов к работе.")
-        
+
         await stop_event.wait()
     finally:
         print("🛑 Останавливаю приложение...")
@@ -721,13 +742,13 @@ async def main():
             task.cancel()
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
-        
+
         if application.updater and application.updater.running:
             await application.updater.stop()
         if application.running:
             await application.stop()
         await application.shutdown()
-        
+
         http_server.shutdown()
         http_server.server_close()
         http_thread.join(timeout=5)
