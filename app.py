@@ -43,7 +43,6 @@ GITHUB_REPO = required_env("GITHUB_REPO")
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json").strip()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-# Заменил дефолт на реальный быстрый модель Groq. Если нужна другая, укажи в .env
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama3-8b-8192").strip()
 
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "UTC").strip()
@@ -90,9 +89,32 @@ def acquire_lock():
 def release_lock():
     global _LOCK_FD
     if _LOCK_FD:
-        fcntl.flock(_LOCK_FD.fileno(), fcntl.LOCK_UN)
+        try:
+            fcntl.flock(_LOCK_FD.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
         _LOCK_FD.close()
         _LOCK_FD = None
+
+# ============================================================
+# RSS-источники
+# ============================================================
+
+RSS_FEEDS = [
+    "https://nplus1.ru/rss",
+    "https://naked-science.ru/feed",
+    "https://www.ixbt.com/export/news.rss",
+    "https://hi-news.ru/feed/",
+    "https://tproger.ru/feed/",
+    "https://the-flow.ru/rss/",
+    "https://www.sports.ru/rss/all.xml",
+    "https://kulturomania.ru/rss/",
+    "https://positime.ru/rss/",
+    "https://www.positive.news/feed/",
+    "https://www.optimistdaily.com/feed/",
+    "http://www.gazeta.ru/export/rss/autonews.xml",
+    "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
+]
 
 # ============================================================
 # Данные и GitHub-хранилище
@@ -143,7 +165,6 @@ def _load_sync():
             _data = fresh_default_data()
             _data.update(loaded)
             
-            # Гарантируем корректность типов
             if not isinstance(_data.get("items"), list): _data["items"] = []
             if not isinstance(_data.get("pending"), dict): _data["pending"] = {}
             if not isinstance(_data.get("stats"), dict): _data["stats"] = fresh_default_data()["stats"]
@@ -290,7 +311,7 @@ def parse_feed_sync(feed_url: str):
     response = requests.get(
         feed_url,
         headers={"User-Agent": "VibeNewsBot/1.0"},
-        timeout=(2, 4) # CONNECT, READ
+        timeout=(2, 4)
     )
     response.raise_for_status()
     return feedparser.parse(response.content)
@@ -315,7 +336,7 @@ async def fetch_fresh_from_feed(feed_url: str, semaphore: asyncio.Semaphore):
                 fresh.append({"entry": entry, "title": title, "feed_url": feed_url, "key": key})
             return fresh
         except asyncio.TimeoutError:
-            pass # Тихий тайм-аут для скорости
+            pass
         except Exception as exc:
             print(f"⚠️ Ошибка RSS {feed_url}: {type(exc).__name__}")
         return []
@@ -335,7 +356,6 @@ async def find_one_new_entry():
                 except Exception:
                     continue
                 if fresh:
-                    # Отменяем остальные задачи, так как мы уже нашли кандидат
                     for t in tasks:
                         t.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
