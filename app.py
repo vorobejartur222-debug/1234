@@ -43,7 +43,8 @@ GITHUB_REPO = required_env("GITHUB_REPO")
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json").strip()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama3-8b-8192").strip()
+# Актуальная модель Groq (llama3-8b-8192 удалена из Groq)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "UTC").strip()
 try:
@@ -51,11 +52,11 @@ try:
 except ZoneInfoNotFoundError as exc:
     raise RuntimeError(f"Неизвестная временная зона: {TIMEZONE_NAME}") from exc
 
-MAX_PARALLEL_FEEDS = 13
-FEED_TOTAL_TIMEOUT = 6
-MAX_ENTRIES_PER_FEED = 10
-MAX_ATTEMPTS = 3
-FIND_TOTAL_TIMEOUT = 45
+MAX_PARALLEL_FEEDS = 10
+FEED_TOTAL_TIMEOUT = 8
+MAX_ENTRIES_PER_FEED = 15
+MAX_ATTEMPTS = 5
+FIND_TOTAL_TIMEOUT = 60
 
 SCHEDULE_HOURS = {10, 14, 18, 22}
 
@@ -97,7 +98,7 @@ def release_lock():
         _LOCK_FD = None
 
 # ============================================================
-# RSS-источники
+# RSS-источники (убраны нерабочие)
 # ============================================================
 
 RSS_FEEDS = [
@@ -106,14 +107,13 @@ RSS_FEEDS = [
     "https://www.ixbt.com/export/news.rss",
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
-    "https://the-flow.ru/rss/",
-    "https://www.sports.ru/rss/all.xml",
     "https://kulturomania.ru/rss/",
-    "https://positime.ru/rss/",
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
     "http://www.gazeta.ru/export/rss/autonews.xml",
     "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
+    "https://lenta.ru/rss/news",
+    "https://ria.ru/export/rss2/archive/index.xml",
 ]
 
 # ============================================================
@@ -150,7 +150,7 @@ def _load_sync():
     try:
         response = requests.get(GITHUB_CONTENTS_URL, headers=GH_HEADERS, timeout=15)
         if response.status_code == 404:
-            print("ℹ️ Файл данных GitHub не найден; будет создан при сохранении.")
+            print("ℹ️ Файл данных GitHub не найден; будет создан при первом сохранении.")
             _data = fresh_default_data()
             _data_sha = None
         elif response.status_code != 200:
@@ -195,14 +195,19 @@ def _save_sync():
                 "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
                 "committer": {"name": "News Bot", "email": "bot@example.com"},
             }
+            # sha нужен только для обновления существующего файла
             if _data_sha:
                 payload["sha"] = _data_sha
 
             response = requests.put(GITHUB_CONTENTS_URL, headers=GH_HEADERS, json=payload, timeout=20)
+            
             if response.status_code in (200, 201):
                 _data_sha = response.json().get("content", {}).get("sha")
+                print(f"✅ Данные сохранены в GitHub (sha: {_data_sha[:8]}...)")
                 return True
+            
             if response.status_code == 409 and attempt < 2:
+                # Конфликт версий — получаем актуальный sha
                 current = requests.get(GITHUB_CONTENTS_URL, headers=GH_HEADERS, timeout=15)
                 if current.status_code == 200:
                     _data_sha = current.json().get("sha")
@@ -210,10 +215,19 @@ def _save_sync():
                 if current.status_code == 404:
                     _data_sha = None
                     continue
-            print(f"⚠️ GitHub PUT {response.status_code}: {response.text[:200]}")
+            
+            if response.status_code == 404 and not _data_sha:
+                # Файл не существует — пробуем создать через другой endpoint
+                print("⚠️ Файл не найден, пробуем создать через API...")
+                # Для создания нового файла PUT без sha должен работать
+                # Если не работает — проблема в правах токена
+                print(f"⚠️ GitHub PUT 404: возможно, токен не имеет прав на запись в репозиторий")
+                return False
+            
+            print(f"️ GitHub PUT {response.status_code}: {response.text[:200]}")
             return False
         except Exception as exc:
-            print(f"❌ Ошибка сохранения в GitHub: {type(exc).__name__}: {exc}")
+            print(f" Ошибка сохранения в GitHub: {type(exc).__name__}: {exc}")
             return False
     return False
 
@@ -252,6 +266,14 @@ def bump_source(feed_url: str):
     stats = _data.setdefault("stats", fresh_default_data()["stats"])
     sources = stats.setdefault("sources", {})
     sources[feed_url] = sources.get(feed_url, 0) + 1
+
+def reset_seen():
+    """Сбросить все увиденные новости (для тестирования)."""
+    global _seen_set
+    _seen_set.clear()
+    _data["items"] = []
+    _data["stats"] = fresh_default_data()["stats"]
+    print("🔄 Seen set сброшен")
 
 # ============================================================
 # Flask health-check для Render
@@ -311,7 +333,7 @@ def parse_feed_sync(feed_url: str):
     response = requests.get(
         feed_url,
         headers={"User-Agent": "VibeNewsBot/1.0"},
-        timeout=(2, 4)
+        timeout=(3, 5)
     )
     response.raise_for_status()
     return feedparser.parse(response.content)
@@ -336,7 +358,7 @@ async def fetch_fresh_from_feed(feed_url: str, semaphore: asyncio.Semaphore):
                 fresh.append({"entry": entry, "title": title, "feed_url": feed_url, "key": key})
             return fresh
         except asyncio.TimeoutError:
-            pass
+            print(f"⏱️ Таймаут RSS: {feed_url}")
         except Exception as exc:
             print(f"⚠️ Ошибка RSS {feed_url}: {type(exc).__name__}")
         return []
@@ -457,7 +479,7 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         candidate = await find_one_new_entry()
 
         if not candidate:
-            await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Новых подходящих публикаций не нашёл.")
+            await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Новых подходящих публикаций не нашёл. Попробуй /reset и затем /next.")
             await save_data()
             return False
 
@@ -468,9 +490,11 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         raw_summary = getattr(entry, "summary", "") or ""
         image_url = extract_image(entry, raw_summary)
 
+        print(f"📝 Найдено: {title[:80]}")
         post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
         if not post_text:
+            print(f"️ AI не справился: {title[:80]}")
             mark_seen(candidate["key"])
             bump_stat("skipped")
             await save_data()
@@ -498,6 +522,7 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
             print(f"⚠️ Не удалось отправить фото, отправляю текст: {exc}")
             await app.bot.send_message(chat_id=ADMIN_ID, text=message_text[:4096], reply_markup=keyboard)
 
+        print(f"📩 Отправлено админу на проверку: {title}")
         return True
 
     await app.bot.send_message(chat_id=ADMIN_ID, text="😔 Не получилось подготовить пост из найденных материалов.")
@@ -544,6 +569,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
+        "/reset — сбросить историю (для тестов)\n"
         "/stats — статистика\n"
         "/help — список команд"
     )
@@ -552,6 +578,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     await update.effective_message.reply_text(
         "/next — найти следующую публикацию\n"
+        "/reset — сбросить seen set (все новости станут новыми)\n"
         "/stats — показать статистику\n"
         "Публикуйте или пропускайте пост кнопками под сообщением."
     )
@@ -560,6 +587,11 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     await update.effective_message.reply_text("🔎 Ищу материал...")
     asyncio.create_task(find_and_send_next(context.application))
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
+    reset_seen()
+    await update.effective_message.reply_text("🔄 История сброшена. Теперь /next найдёт свежие новости.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
@@ -570,6 +602,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Опубликовано: {stats.get('published', 0)}\n"
         f"Пропущено: {stats.get('skipped', 0)}\n"
         f"Ожидают решения: {len(pending_queue)}\n"
+        f"В seen set: {len(_seen_set)}\n"
         f"Источников с публикациями: {len(sources)}"
     )
 
@@ -639,10 +672,16 @@ async def main():
     acquire_lock()
     await load_data()
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+    
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("next", next_command))
+    application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(review_callback))
     application.add_error_handler(error_handler)
@@ -668,7 +707,10 @@ async def main():
         if application.updater is None:
             raise RuntimeError("У Telegram Application отсутствует Updater")
         
-        await application.updater.start_polling()
+        # Небольшая задержка чтобы избежать конфликта с предыдущим инстансом
+        await asyncio.sleep(2)
+        await application.updater.start_polling(drop_pending_updates=True)
+        
         background_tasks = [asyncio.create_task(schedule_loop(application), name="schedule")]
         print("✅ Бот запущен и готов к работе.")
         
