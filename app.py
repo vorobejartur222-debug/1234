@@ -102,16 +102,41 @@ def release_lock():
 # ============================================================
 
 RSS_FEEDS = [
+    # Наука и технологии
     "https://nplus1.ru/rss",
     "https://naked-science.ru/feed",
     "https://www.ixbt.com/export/news.rss",
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
+    
+    # Культура
     "https://kulturomania.ru/rss/",
+    "https://aif.ru/rss/culture.php",
+    
+    # Позитив
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
+    
+    # Авто
     "http://www.gazeta.ru/export/rss/autonews.xml",
+    "https://aif.ru/rss/automobile.php",
+    
+    # Кино
     "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
+    
+    # Игры
+    "https://www.playground.ru/rss/news",
+    
+    # Беларусь
+    "https://charter97.link/ru/page/rss/",
+    "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
+    "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
+    
+    # Спорт
+    "https://aif.ru/rss/sport.php",
+    
+    # Здоровье
+    "https://aif.ru/rss/health.php",
 ]
 
 # ============================================================
@@ -385,26 +410,18 @@ def rewrite_with_ai(title: str, summary: str):
         print("⚠️ GROQ_API_KEY не задан.")
         return None
 
-    prompt = f"""Ты — редактор молодёжного Telegram-канала +VIBE NEWS.
-Напиши короткий, связный и содержательный пост на русском языке.
+    prompt = f"""Ты — автор молодёжного Telegram-канала +VIBE NEWS.
+Пиши живо, дерзко, с лёгким юмором.
 
-ВАЖНО:
-- Если заголовок или описание на английском — ПЕРЕВЕДИ их на русский и напиши пост на русском.
-- Рассказывай только об одном событии.
-- Используй только факты из материалов ниже. Ничего не выдумывай.
+СТИЛЬ:
+- Сленг уместен: «вайб», «топчик», «база», «рофл».
+- Задавай вопрос подписчикам в конце.
+- Не пиши «новость», «сообщается», «по данным».
 
-Стиль:
-- Дружелюбный и спокойный, немного серьёзнее развлекательного.
-- Без навязчивого сленга и кликбейта.
-- Простые слова, естественные фразы.
-
-Формат:
-- 2–3 законченных предложения.
-- Не более 500 символов.
-- Начни с одного уместного эмодзи.
-- Закончи полной фразой с точкой.
-- Без ссылок, хэштегов, заголовков.
-
+ФОРМАТ:
+- 2-4 предложения, до 700 символов.
+- 6-10 эмодзи по смыслу.
+- Начни с яркого эмодзи.
 Заголовок источника:
 {title}
 
