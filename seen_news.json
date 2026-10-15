@@ -1,4 +1,10 @@
 {
-  "items": ["test123"],
-  "last_feed_index": 0
+  "items": [],
+  "pending": {},
+  "stats": {
+    "published": 0,
+    "skipped": 0,
+    "sources": {}
+  },
+  "last_schedule_slot": ""
 }
