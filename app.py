@@ -43,7 +43,12 @@ GITHUB_REPO = required_env("GITHUB_REPO").strip()
 GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json").strip()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
+
+print(f"🔧 GROQ_MODEL = '{GROQ_MODEL}'")
+print(f"🔧 GROQ_API_KEY = {'задан' if GROQ_API_KEY else 'НЕ ЗАДАН'}")
+print(f"🔧 GITHUB_REPO = '{GITHUB_REPO}'")
+print(f"🔧 GITHUB_DATA_FILE = '{GITHUB_DATA_FILE}'")
 
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "UTC").strip()
 try:
@@ -108,33 +113,33 @@ RSS_FEEDS = [
     "https://www.ixbt.com/export/news.rss",
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
-    
+
     # Культура
     "https://kulturomania.ru/rss/",
     "https://aif.ru/rss/culture.php",
-    
+
     # Позитив
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
-    
+
     # Авто
     "http://www.gazeta.ru/export/rss/autonews.xml",
     "https://aif.ru/rss/automobile.php",
-    
+
     # Кино
     "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
-    
+
     # Игры
     "https://www.playground.ru/rss/news",
-    
+
     # Беларусь
     "https://charter97.link/ru/page/rss/",
     "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
     "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
-    
+
     # Спорт
     "https://aif.ru/rss/sport.php",
-    
+
     # Здоровье
     "https://aif.ru/rss/health.php",
 ]
@@ -167,6 +172,9 @@ GH_HEADERS = {
 _encoded_repo = quote(GITHUB_REPO, safe="/")
 _encoded_data_file = quote(GITHUB_DATA_FILE, safe="/")
 GITHUB_CONTENTS_URL = f"https://api.github.com/repos/{_encoded_repo}/contents/{_encoded_data_file}"
+
+print(f"🔧 GITHUB URL = {GITHUB_CONTENTS_URL}")
+
 
 def _load_sync():
     global _data, _data_sha, pending_queue, _seen_set
@@ -207,6 +215,7 @@ def _load_sync():
     print(f"💾 Загружено: {len(_data['items'])} items, {len(pending_queue)} pending")
     return _data
 
+
 def _save_sync():
     global _data_sha
     _data["pending"] = pending_queue
@@ -244,9 +253,11 @@ def _save_sync():
             return False
     return False
 
+
 async def load_data():
     async with _data_lock:
         return await asyncio.to_thread(_load_sync)
+
 
 async def save_data():
     async with _data_lock:
@@ -256,8 +267,10 @@ async def save_data():
             print("⚠️ Тайм-аут сохранения данных в GitHub.")
             return False
 
+
 def is_seen(key: str) -> bool:
     return key in _seen_set
+
 
 def mark_seen(key: str):
     if key in _seen_set:
@@ -271,14 +284,17 @@ def mark_seen(key: str):
         for old_key in removed:
             _seen_set.discard(old_key)
 
+
 def bump_stat(stat_name: str):
     stats = _data.setdefault("stats", fresh_default_data()["stats"])
     stats[stat_name] = stats.get(stat_name, 0) + 1
+
 
 def bump_source(feed_url: str):
     stats = _data.setdefault("stats", fresh_default_data()["stats"])
     sources = stats.setdefault("sources", {})
     sources[feed_url] = sources.get(feed_url, 0) + 1
+
 
 def reset_seen():
     global _seen_set
@@ -287,16 +303,19 @@ def reset_seen():
     _data["stats"] = fresh_default_data()["stats"]
     print("🔄 Seen set сброшен")
 
+
 # ============================================================
 # Flask health-check
 # ============================================================
 
 flask_app = Flask(__name__)
 
+
 @flask_app.route("/")
 @flask_app.route("/health")
 def health():
     return "OK", 200
+
 
 # ============================================================
 # RSS: обработка и фильтр
@@ -310,6 +329,7 @@ def clean_html(raw: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
+
 def get_summary(entry) -> str:
     summary = getattr(entry, "summary", "") or ""
     if not summary:
@@ -318,9 +338,11 @@ def get_summary(entry) -> str:
             summary = contents[0].get("value", "")
     return clean_html(summary)[:1200]
 
+
 def get_item_key(entry, feed_url: str, title: str) -> str:
     source_id = getattr(entry, "id", None) or getattr(entry, "link", None) or f"{feed_url}:{title}"
     return hashlib.sha256(str(source_id).encode("utf-8")).hexdigest()
+
 
 def extract_image(entry, raw_summary: str = ""):
     for field in ("media_content", "media_thumbnail"):
@@ -333,16 +355,18 @@ def extract_image(entry, raw_summary: str = ""):
     match = re.search(r"""<img[^>]+src=["']([^"']+)["']""", raw_summary or "", re.IGNORECASE)
     return match.group(1) if match else None
 
+
 BLOCK_MARKERS = [
     "туториал", "руководство", "как я ", "как сделать", "how to", "tutorial",
     "война", "убит", "погиб", "теракт", "катастрофа", "трагедия", "авария", "смерть", "умер",
-    # политика (чтобы не забивать канал)
     "путин", "зеленск", "трамп", "байден", "нато", "санкц", "кремл", "госдум", "минобороны",
 ]
+
 
 def is_news_item(title: str, summary: str) -> bool:
     text = f"{title} {summary}".lower()
     return not any(marker in text for marker in BLOCK_MARKERS)
+
 
 def parse_feed_sync(feed_url: str):
     response = requests.get(
@@ -352,6 +376,7 @@ def parse_feed_sync(feed_url: str):
     )
     response.raise_for_status()
     return feedparser.parse(response.content)
+
 
 async def fetch_fresh_from_feed(feed_url: str, semaphore: asyncio.Semaphore):
     async with semaphore:
@@ -378,6 +403,7 @@ async def fetch_fresh_from_feed(feed_url: str, semaphore: asyncio.Semaphore):
             print(f"⚠️ Ошибка RSS {feed_url}: {type(exc).__name__}")
         return []
 
+
 async def find_one_new_entry():
     feeds = list(RSS_FEEDS)
     random.shuffle(feeds)
@@ -401,6 +427,7 @@ async def find_one_new_entry():
     except asyncio.CancelledError:
         return None
 
+
 # ============================================================
 # Groq: генерация
 # ============================================================
@@ -410,18 +437,27 @@ def rewrite_with_ai(title: str, summary: str):
         print("⚠️ GROQ_API_KEY не задан.")
         return None
 
-    prompt = f"""Ты — автор молодёжного Telegram-канала +VIBE NEWS.
-Пиши живо, дерзко, с лёгким юмором.
+    prompt = f"""Ты — редактор молодёжного Telegram-канала +VIBE NEWS.
+Напиши короткий, связный и содержательный пост на русском языке.
+
+ВАЖНО:
+- Если заголовок или описание на английском, белорусском или украинском — ПЕРЕВЕДИ их на русский.
+- Даже если оригинал на другом языке, финальный пост должен быть ТОЛЬКО на русском.
+- Рассказывай только об одном событии.
+- Используй только факты из материалов ниже. Ничего не выдумывай.
 
 СТИЛЬ:
-- Сленг уместен: «вайб», «топчик», «база», «рофл».
-- Задавай вопрос подписчикам в конце.
-- Не пиши «новость», «сообщается», «по данным».
+- Дружелюбный и спокойный, немного серьёзнее развлекательного.
+- Без навязчивого сленга и кликбейта.
+- Простые слова, естественные фразы.
 
 ФОРМАТ:
-- 2-4 предложения, до 700 символов.
-- 6-10 эмодзи по смыслу.
-- Начни с яркого эмодзи.
+- 2–3 законченных предложения.
+- Не более 500 символов.
+- Начни с одного уместного эмодзи.
+- Закончи полной фразой с точкой.
+- Без ссылок, хэштегов, заголовков.
+
 Заголовок источника:
 {title}
 
@@ -430,7 +466,7 @@ def rewrite_with_ai(title: str, summary: str):
 
 Напиши только готовый пост:"""
 
-    for _ in range(2):
+    for attempt in range(2):
         try:
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
@@ -440,20 +476,31 @@ def rewrite_with_ai(title: str, summary: str):
                 timeout=GROQ_TIMEOUT,
             )
             if not response.choices:
+                print(f"⚠️ Groq: пустой ответ (попытка {attempt + 1})")
                 continue
 
             choice = response.choices[0]
             text = (choice.message.content or "").strip()
+            finish_reason = getattr(choice, "finish_reason", None)
 
-            if getattr(choice, "finish_reason", None) == "length":
+            print(f"ℹ️ Groq attempt={attempt + 1}, finish_reason={finish_reason}, len={len(text)}")
+            print(f"ℹ️ Groq text[:200]={text[:200]!r}")
+
+            if finish_reason == "length":
+                print("⚠️ Groq: обрезано лимитом")
                 continue
 
             text = re.sub(r"https?://\S+", "", text).strip()
-            if not text or text[-1] not in ".!?…»”":
+            if not text:
+                print("⚠️ Groq: пустой текст после очистки")
+                continue
+            if text[-1] not in ".!?…»”":
+                print(f"⚠️ Groq: текст не заканчивается на точку/!/? — {text[-50:]!r}")
                 continue
             if len(text) > 700:
                 text = text[:697].rsplit(" ", 1)[0].rstrip() + "..."
             if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", text)) < 10:
+                print(f"⚠️ Groq: слишком короткий — {text!r}")
                 continue
 
             return text
@@ -461,6 +508,7 @@ def rewrite_with_ai(title: str, summary: str):
             print(f"❌ Groq: {type(exc).__name__}: {exc}")
             return None
     return None
+
 
 # ============================================================
 # Telegram: отправка и модерация
@@ -472,6 +520,7 @@ def build_keyboard(review_id: str):
         InlineKeyboardButton("⏭️ Дальше", callback_data=f"skip:{review_id}"),
     ]])
 
+
 async def safe_edit(query, text: str):
     try:
         await query.edit_message_text(text)
@@ -480,6 +529,7 @@ async def safe_edit(query, text: str):
             await query.edit_message_caption(caption=text)
         except Exception:
             pass
+
 
 async def _find_and_send_next_inner(app: Application, max_attempts: int):
     for attempt in range(1, max_attempts + 1):
@@ -551,6 +601,7 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
     )
     return False
 
+
 async def find_and_send_next(app: Application, max_attempts: int = MAX_ATTEMPTS):
     if _find_lock.locked():
         print("⚠️ Поиск уже идёт, пропускаю вызов.")
@@ -573,6 +624,7 @@ async def find_and_send_next(app: Application, max_attempts: int = MAX_ATTEMPTS)
             pass
         return False
 
+
 async def publish_to_channel(app: Application, item: dict):
     post_text = item["post_text"]
     image_url = item.get("image_url")
@@ -586,6 +638,7 @@ async def publish_to_channel(app: Application, item: dict):
             pass
     return await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
 
+
 # ============================================================
 # Команды
 # ============================================================
@@ -594,6 +647,7 @@ async def require_admin(update: Update):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return False
     return True
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
@@ -606,6 +660,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — список команд"
     )
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     await update.effective_message.reply_text(
@@ -616,13 +671,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Публикуйте или пропускайте пост кнопками под сообщением."
     )
 
+
 async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     await update.effective_message.reply_text("🔎 Ищу материал...")
     asyncio.create_task(find_and_send_next(context.application))
 
+
 async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await next_command(update, context)
+
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
@@ -630,6 +688,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "🔄 История сброшена. Теперь /next найдёт свежие новости."
     )
+
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
@@ -643,6 +702,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"В seen set: {len(_seen_set)}\n"
         f"Источников с публикациями: {len(sources)}"
     )
+
 
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -684,6 +744,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_edit(query, "Неизвестное действие.")
 
+
 # ============================================================
 # Фоновые задачи и запуск
 # ============================================================
@@ -703,8 +764,10 @@ async def schedule_loop(app: Application):
             print(f"❌ Ошибка расписания: {type(exc).__name__}: {exc}")
         await asyncio.sleep(30)
 
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"❌ Ошибка Telegram: {context.error}")
+
 
 async def main():
     acquire_lock()
@@ -771,6 +834,7 @@ async def main():
         http_thread.join(timeout=5)
         release_lock()
         print("✅ Приложение остановлено.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
