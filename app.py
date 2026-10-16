@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import fcntl
 import hashlib
 import html
@@ -12,17 +11,18 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
-from urllib.parse import quote
+from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import feedparser
 import requests
 from flask import Flask
 from groq import Groq
+from supabase import create_client, Client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from werkzeug.serving import make_server
+
 
 # ============================================================
 # Настройки
@@ -34,27 +34,27 @@ def required_env(name: str) -> str:
         raise RuntimeError(f"Не задана переменная окружения {name}")
     return value
 
+
 TELEGRAM_TOKEN = required_env("TELEGRAM_TOKEN")
 CHANNEL_ID = required_env("CHANNEL_ID")
 ADMIN_ID = int(required_env("ADMIN_ID"))
 
-GITHUB_TOKEN = required_env("GITHUB_TOKEN")
-GITHUB_REPO = required_env("GITHUB_REPO").strip()
-GITHUB_DATA_FILE = os.environ.get("GITHUB_DATA_FILE", "seen_news.json").strip()
+SUPABASE_URL = required_env("SUPABASE_URL")
+SUPABASE_KEY = required_env("SUPABASE_KEY")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
 
 print(f"🔧 GROQ_MODEL = '{GROQ_MODEL}'")
-print(f"🔧 GROQ_API_KEY = {'задан' if GROQ_API_KEY else 'НЕ ЗАДАН'}")
-print(f"🔧 GITHUB_REPO = '{GITHUB_REPO}'")
-print(f"🔧 GITHUB_DATA_FILE = '{GITHUB_DATA_FILE}'")
+print(f"🔧 SUPABASE_URL = '{SUPABASE_URL}'")
+print(f"🔧 SUPABASE_KEY = {'задан' if SUPABASE_KEY else 'НЕ ЗАДАН'}")
 
-TIMEZONE_NAME = os.environ.get("TIMEZONE", "UTC").strip()
+TIMEZONE_NAME = os.environ.get("TIMEZONE", "Europe/Minsk").strip()
 try:
     LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
-except ZoneInfoNotFoundError as exc:
-    raise RuntimeError(f"Неизвестная временная зона: {TIMEZONE_NAME}") from exc
+except ZoneInfoNotFoundError:
+    LOCAL_TZ = ZoneInfo("UTC")
+    print(f"⚠️ Неизвестная временная зона {TIMEZONE_NAME}, использую UTC")
 
 MAX_PARALLEL_FEEDS = 10
 FEED_TOTAL_TIMEOUT = 8
@@ -65,10 +65,10 @@ GROQ_TIMEOUT = 20
 
 SCHEDULE_HOURS = {10, 14, 18, 22}
 
-if "/" not in GITHUB_REPO:
-    raise RuntimeError("GITHUB_REPO должен иметь формат owner/repository")
-
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 # ============================================================
 # Защита от двойного запуска
@@ -76,6 +76,7 @@ groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 LOCK_FILE = "/tmp/bot.lock"
 _LOCK_FD = None
+
 
 def acquire_lock():
     global _LOCK_FD
@@ -86,11 +87,11 @@ def acquire_lock():
         _LOCK_FD.close()
         print("⚠️ Бот уже запущен в этом контейнере.")
         sys.exit(1)
-
     _LOCK_FD.seek(0)
     _LOCK_FD.truncate()
     _LOCK_FD.write(str(os.getpid()))
     _LOCK_FD.flush()
+
 
 def release_lock():
     global _LOCK_FD
@@ -102,169 +103,103 @@ def release_lock():
         _LOCK_FD.close()
         _LOCK_FD = None
 
+
 # ============================================================
 # RSS-источники
 # ============================================================
 
 RSS_FEEDS = [
-    # Наука и технологии
     "https://nplus1.ru/rss",
     "https://naked-science.ru/feed",
     "https://www.ixbt.com/export/news.rss",
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
-
-    # Культура
     "https://kulturomania.ru/rss/",
     "https://aif.ru/rss/culture.php",
-
-    # Позитив
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
-
-    # Авто
     "http://www.gazeta.ru/export/rss/autonews.xml",
     "https://aif.ru/rss/automobile.php",
-
-    # Кино
     "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
-
-    # Игры
     "https://www.playground.ru/rss/news",
-
-    # Беларусь
     "https://charter97.link/ru/page/rss/",
     "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
     "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
-
-    # Спорт
     "https://aif.ru/rss/sport.php",
-
-    # Здоровье
     "https://aif.ru/rss/health.php",
 ]
 
+
 # ============================================================
-# Данные и GitHub-хранилище
+# Supabase-хранилище
 # ============================================================
 
-def fresh_default_data():
-    return {
-        "items": [],
-        "pending": {},
-        "stats": {"published": 0, "skipped": 0, "sources": {}},
-        "last_schedule_slot": "",
-    }
+DEFAULT_DATA = {
+    "items": [],
+    "pending": {},
+    "stats": {"published": 0, "skipped": 0, "sources": {}},
+    "last_schedule_slot": "",
+}
 
-_data = fresh_default_data()
-_data_sha = None
+_data = dict(DEFAULT_DATA)
 _data_lock = asyncio.Lock()
 _find_lock = asyncio.Lock()
 _seen_set = set()
 pending_queue = _data["pending"]
 
-GH_HEADERS = {
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
 
-_encoded_repo = quote(GITHUB_REPO, safe="/")
-_encoded_data_file = quote(GITHUB_DATA_FILE, safe="/")
-GITHUB_CONTENTS_URL = f"https://api.github.com/repos/{_encoded_repo}/contents/{_encoded_data_file}"
-
-print(f"🔧 GITHUB URL = {GITHUB_CONTENTS_URL}")
-
-
-def _load_sync():
-    global _data, _data_sha, pending_queue, _seen_set
+def load_data_sync():
+    global _data, pending_queue, _seen_set
     try:
-        response = requests.get(GITHUB_CONTENTS_URL, headers=GH_HEADERS, timeout=15)
-        if response.status_code == 404:
-            print("ℹ️ Файл данных GitHub не найден; будет создан при первом сохранении.")
-            _data = fresh_default_data()
-            _data_sha = None
-        elif response.status_code != 200:
-            print(f"⚠️ GitHub GET {response.status_code}: {response.text[:200]}")
-            _data = fresh_default_data()
-            _data_sha = None
+        response = supabase.table("bot_data").select("data").eq("id", 1).execute()
+        if not response.data:
+            _data = dict(DEFAULT_DATA)
         else:
-            payload = response.json()
-            file_content = base64.b64decode(payload["content"]).decode("utf-8")
-            loaded = json.loads(file_content)
-
-            _data = fresh_default_data()
+            loaded = response.data[0].get("data") or {}
+            if isinstance(loaded, str):
+                loaded = json.loads(loaded)
+            _data = dict(DEFAULT_DATA)
             _data.update(loaded)
-
-            if not isinstance(_data.get("items"), list): _data["items"] = []
-            if not isinstance(_data.get("pending"), dict): _data["pending"] = {}
-            if not isinstance(_data.get("stats"), dict): _data["stats"] = fresh_default_data()["stats"]
-
-            _data["stats"].setdefault("published", 0)
-            _data["stats"].setdefault("skipped", 0)
-            _data["stats"].setdefault("sources", {})
+            _data.setdefault("items", [])
+            _data.setdefault("pending", {})
+            _data.setdefault("stats", {"published": 0, "skipped": 0, "sources": {}})
             _data.setdefault("last_schedule_slot", "")
-            _data_sha = payload.get("sha")
     except Exception as exc:
-        print(f"❌ Ошибка загрузки данных из GitHub: {type(exc).__name__}: {exc}")
-        _data = fresh_default_data()
-        _data_sha = None
+        print(f"❌ Ошибка загрузки из Supabase: {type(exc).__name__}: {exc}")
+        _data = dict(DEFAULT_DATA)
 
     pending_queue = _data["pending"]
     _seen_set = set(_data.get("items", []))
-    print(f"💾 Загружено: {len(_data['items'])} items, {len(pending_queue)} pending")
+    print(f"💾 Загружено из Supabase: {len(_data['items'])} items, {len(pending_queue)} pending")
     return _data
 
 
-def _save_sync():
-    global _data_sha
-    _data["pending"] = pending_queue
-    for attempt in range(3):
-        try:
-            content = json.dumps(_data, ensure_ascii=False, indent=2)
-            payload = {
-                "message": f"Update bot data {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
-                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-                "committer": {"name": "News Bot", "email": "bot@example.com"},
-            }
-            if _data_sha:
-                payload["sha"] = _data_sha
-
-            response = requests.put(GITHUB_CONTENTS_URL, headers=GH_HEADERS, json=payload, timeout=20)
-
-            if response.status_code in (200, 201):
-                _data_sha = response.json().get("content", {}).get("sha")
-                print(f"✅ Данные сохранены в GitHub (sha: {_data_sha[:8]}...)")
-                return True
-
-            if response.status_code == 409 and attempt < 2:
-                current = requests.get(GITHUB_CONTENTS_URL, headers=GH_HEADERS, timeout=15)
-                if current.status_code == 200:
-                    _data_sha = current.json().get("sha")
-                    continue
-                if current.status_code == 404:
-                    _data_sha = None
-                    continue
-
-            print(f"⚠️ GitHub PUT {response.status_code}: {response.text[:200]}")
-            return False
-        except Exception as exc:
-            print(f"❌ Ошибка сохранения в GitHub: {type(exc).__name__}: {exc}")
-            return False
-    return False
+def save_data_sync():
+    try:
+        _data["pending"] = pending_queue
+        supabase.table("bot_data").upsert(
+            {"id": 1, "data": _data, "updated_at": datetime.utcnow().isoformat()}
+        ).execute()
+        print(f"✅ Сохранено в Supabase: {len(_data['items'])} items, {len(pending_queue)} pending")
+        return True
+    except Exception as exc:
+        print(f"❌ Ошибка сохранения в Supabase: {type(exc).__name__}: {exc}")
+        return False
 
 
 async def load_data():
     async with _data_lock:
-        return await asyncio.to_thread(_load_sync)
+        return await asyncio.to_thread(load_data_sync)
 
 
 async def save_data():
     async with _data_lock:
         try:
-            return await asyncio.wait_for(asyncio.to_thread(_save_sync), timeout=15)
+            return await asyncio.wait_for(
+                asyncio.to_thread(save_data_sync), timeout=15
+            )
         except asyncio.TimeoutError:
-            print("⚠️ Тайм-аут сохранения данных в GitHub.")
+            print("⚠️ Тайм-аут сохранения в Supabase.")
             return False
 
 
@@ -286,12 +221,12 @@ def mark_seen(key: str):
 
 
 def bump_stat(stat_name: str):
-    stats = _data.setdefault("stats", fresh_default_data()["stats"])
+    stats = _data.setdefault("stats", DEFAULT_DATA["stats"])
     stats[stat_name] = stats.get(stat_name, 0) + 1
 
 
 def bump_source(feed_url: str):
-    stats = _data.setdefault("stats", fresh_default_data()["stats"])
+    stats = _data.setdefault("stats", DEFAULT_DATA["stats"])
     sources = stats.setdefault("sources", {})
     sources[feed_url] = sources.get(feed_url, 0) + 1
 
@@ -300,7 +235,7 @@ def reset_seen():
     global _seen_set
     _seen_set.clear()
     _data["items"] = []
-    _data["stats"] = fresh_default_data()["stats"]
+    _data["stats"] = dict(DEFAULT_DATA["stats"])
     print("🔄 Seen set сброшен")
 
 
@@ -318,7 +253,7 @@ def health():
 
 
 # ============================================================
-# RSS: обработка и фильтр
+# RSS: обработка
 # ============================================================
 
 def clean_html(raw: str) -> str:
@@ -372,7 +307,7 @@ def parse_feed_sync(feed_url: str):
     response = requests.get(
         feed_url,
         headers={"User-Agent": "VibeNewsBot/1.0"},
-        timeout=(3, 5)
+        timeout=(3, 5),
     )
     response.raise_for_status()
     return feedparser.parse(response.content)
@@ -395,7 +330,10 @@ async def fetch_fresh_from_feed(feed_url: str, semaphore: asyncio.Semaphore):
                 if not is_news_item(title, summary):
                     mark_seen(key)
                     continue
-                fresh.append({"entry": entry, "title": title, "feed_url": feed_url, "key": key})
+                fresh.append({
+                    "entry": entry, "title": title,
+                    "feed_url": feed_url, "key": key,
+                })
             return fresh
         except asyncio.TimeoutError:
             print(f"⏱️ Таймаут RSS: {feed_url}")
@@ -466,13 +404,13 @@ def rewrite_with_ai(title: str, summary: str):
 
 Напиши только готовый пост:"""
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.5,
-                max_tokens=500,
+                max_tokens=900,
                 timeout=GROQ_TIMEOUT,
             )
             if not response.choices:
@@ -484,7 +422,6 @@ def rewrite_with_ai(title: str, summary: str):
             finish_reason = getattr(choice, "finish_reason", None)
 
             print(f"ℹ️ Groq attempt={attempt + 1}, finish_reason={finish_reason}, len={len(text)}")
-            print(f"ℹ️ Groq text[:200]={text[:200]!r}")
 
             if finish_reason == "length":
                 print("⚠️ Groq: обрезано лимитом")
@@ -495,7 +432,7 @@ def rewrite_with_ai(title: str, summary: str):
                 print("⚠️ Groq: пустой текст после очистки")
                 continue
             if text[-1] not in ".!?…»”":
-                print(f"⚠️ Groq: текст не заканчивается на точку/!/? — {text[-50:]!r}")
+                print(f"⚠️ Groq: текст не заканчивается на точку — {text[-50:]!r}")
                 continue
             if len(text) > 700:
                 text = text[:697].rsplit(" ", 1)[0].rstrip() + "..."
@@ -567,7 +504,8 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         review_id = uuid.uuid4().hex[:8]
         pending_queue[review_id] = {
             "title": title, "post_text": post_text,
-            "image_url": image_url, "source_url": source_url, "created_at": time.time(),
+            "image_url": image_url, "source_url": source_url,
+            "created_at": time.time(),
         }
         await save_data()
 
@@ -685,6 +623,7 @@ async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     reset_seen()
+    await save_data()
     await update.effective_message.reply_text(
         "🔄 История сброшена. Теперь /next найдёт свежие новости."
     )
