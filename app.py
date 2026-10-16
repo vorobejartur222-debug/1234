@@ -20,7 +20,14 @@ from flask import Flask
 from groq import Groq
 from supabase import create_client, Client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from werkzeug.serving import make_server
 
 
@@ -66,7 +73,6 @@ GROQ_TIMEOUT = 20
 SCHEDULE_HOURS = {10, 14, 18, 22}
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
@@ -367,7 +373,7 @@ async def find_one_new_entry():
 
 
 # ============================================================
-# Groq: генерация
+# Groq: генерация — ВАЙБОВЫЙ ПРОМПТ (обновлён)
 # ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
@@ -375,25 +381,26 @@ def rewrite_with_ai(title: str, summary: str):
         print("⚠️ GROQ_API_KEY не задан.")
         return None
 
-    prompt = f"""Ты — редактор молодёжного Telegram-канала +VIBE NEWS.
-Напиши короткий, связный и содержательный пост на русском языке.
+    prompt = f"""Ты — автор молодёжного Telegram-канала +VIBE NEWS.
+Пиши живо, с лёгким юмором. Как будто рассказываешь другу.
 
 ВАЖНО:
-- Если заголовок или описание на английском, белорусском или украинском — ПЕРЕВЕДИ их на русский.
-- Даже если оригинал на другом языке, финальный пост должен быть ТОЛЬКО на русском.
-- Рассказывай только об одном событии.
-- Используй только факты из материалов ниже. Ничего не выдумывай.
+- Если заголовок или описание на английском, белорусском — ПЕРЕВЕДИ их на русский.
+- Финальный пост — ТОЛЬКО на русском.
+- Только одно событие. Используй только факты из источника. Ничего не выдумывай.
+- Не пиши «новость», «сообщается», «по данным», «по информации».
 
 СТИЛЬ:
-- Дружелюбный и спокойный, немного серьёзнее развлекательного.
-- Без навязчивого сленга и кликбейта.
-- Простые слова, естественные фразы.
+- Живой, энергичный, с лёгким вайбом. Уместен сленг: «вайб», «топчик», «кринж», «кайф».
+- В конце — короткий вопрос или лёгкая шутка для подписчиков, если уместно.
+- Без кликбейта и громких неподтверждённых заявлений.
 
 ФОРМАТ:
-- 2–3 законченных предложения.
-- Не более 500 символов.
-- Начни с одного уместного эмодзи.
-- Закончи полной фразой с точкой.
+- 4–7 предложений, до 900 символов.
+- РОВНО 3 эмодзи — не больше, не меньше.
+- Начни с одного яркого эмодзи (🚀, 🔥, 💡, 🎉, 🌟, 🤯, 😎, 💥, 🎮, 🎵, 🧠, 🌍, ✨).
+- Остальные 2 эмодзи — по смыслу в тексте.
+- Закончи полной фразой с точкой, вопросительным или восклицательным знаком.
 - Без ссылок, хэштегов, заголовков.
 
 Заголовок источника:
@@ -409,8 +416,8 @@ def rewrite_with_ai(title: str, summary: str):
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
-                max_tokens=900,
+                temperature=0.85,
+                max_tokens=1200,
                 timeout=GROQ_TIMEOUT,
             )
             if not response.choices:
@@ -434,8 +441,8 @@ def rewrite_with_ai(title: str, summary: str):
             if text[-1] not in ".!?…»”":
                 print(f"⚠️ Groq: текст не заканчивается на точку — {text[-50:]!r}")
                 continue
-            if len(text) > 700:
-                text = text[:697].rsplit(" ", 1)[0].rstrip() + "..."
+            if len(text) > 1000:
+                text = text[:997].rsplit(" ", 1)[0].rstrip() + "..."
             if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", text)) < 10:
                 print(f"⚠️ Groq: слишком короткий — {text!r}")
                 continue
@@ -454,6 +461,7 @@ def rewrite_with_ai(title: str, summary: str):
 def build_keyboard(review_id: str):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🚀 Опубликовать", callback_data=f"publish:{review_id}"),
+        InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{review_id}"),
         InlineKeyboardButton("⏭️ Дальше", callback_data=f"skip:{review_id}"),
     ]])
 
@@ -466,6 +474,35 @@ async def safe_edit(query, text: str):
             await query.edit_message_caption(caption=text)
         except Exception:
             pass
+
+
+async def send_post_for_review(app: Application, review_id: str, item: dict):
+    """Отправляет (или переотправляет) пост админу с кнопками."""
+    message_text = f"📬 Пост на проверку\n\n{item['post_text']}"
+    keyboard = build_keyboard(review_id)
+    image_url = item.get("image_url")
+
+    try:
+        if image_url and len(item["post_text"]) <= 1024:
+            await app.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=image_url,
+                caption=message_text,
+                reply_markup=keyboard,
+            )
+        else:
+            await app.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=message_text[:4096],
+                reply_markup=keyboard,
+            )
+    except Exception as exc:
+        print(f"⚠️ Не удалось отправить фото: {exc}")
+        await app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=message_text[:4096],
+            reply_markup=keyboard,
+        )
 
 
 async def _find_and_send_next_inner(app: Application, max_attempts: int):
@@ -509,27 +546,7 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         }
         await save_data()
 
-        message_text = f"📬 Пост на проверку\n\n{post_text}"
-        keyboard = build_keyboard(review_id)
-
-        try:
-            if image_url and len(post_text) <= 1024:
-                await app.bot.send_photo(
-                    chat_id=ADMIN_ID, photo=image_url,
-                    caption=message_text, reply_markup=keyboard,
-                )
-            else:
-                await app.bot.send_message(
-                    chat_id=ADMIN_ID, text=message_text[:4096],
-                    reply_markup=keyboard,
-                )
-        except Exception as exc:
-            print(f"⚠️ Не удалось отправить фото: {exc}")
-            await app.bot.send_message(
-                chat_id=ADMIN_ID, text=message_text[:4096],
-                reply_markup=keyboard,
-            )
-
+        await send_post_for_review(app, review_id, pending_queue[review_id])
         print(f"📩 Отправлено админу на проверку: {title}")
         return True
 
@@ -592,21 +609,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
-        "/now — то же, что /next\n"
+        "/edit — изменить последний пост\n"
         "/reset — сбросить историю\n"
-        "/stats — статистика\n"
-        "/help — список команд"
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_admin(update): return
-    await update.effective_message.reply_text(
-        "/next — найти следующую публикацию\n"
-        "/now — то же, что /next\n"
-        "/reset — сбросить seen set\n"
-        "/stats — показать статистику\n"
-        "Публикуйте или пропускайте пост кнопками под сообщением."
+        "/stats — статистика"
     )
 
 
@@ -616,8 +621,64 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(find_and_send_next(context.application))
 
 
-async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await next_command(update, context)
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает редактирование последнего поста в очереди."""
+    if not await require_admin(update): return
+
+    if not pending_queue:
+        await update.effective_message.reply_text(
+            "😔 Нет постов в очереди. Сначала /next."
+        )
+        return
+
+    review_id = list(pending_queue.keys())[-1]
+    item = pending_queue[review_id]
+
+    context.user_data["editing_review_id"] = review_id
+
+    await update.effective_message.reply_text(
+        f"✏️ Отправь новый текст для поста:\n\n"
+        f"📝 Текущий текст:\n{item['post_text']}\n\n"
+        f"Отправь /cancel чтобы отменить."
+    )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
+    if "editing_review_id" in context.user_data:
+        del context.user_data["editing_review_id"]
+        await update.effective_message.reply_text("❌ Редактирование отменено.")
+    else:
+        await update.effective_message.reply_text("Нечего отменять.")
+
+
+async def handle_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    if "editing_review_id" not in context.user_data:
+        return
+    if not update.message or not update.message.text:
+        return
+
+    review_id = context.user_data.pop("editing_review_id")
+    item = pending_queue.get(review_id)
+
+    if not item:
+        await update.message.reply_text("⚠️ Пост уже обработан. Начни заново с /next.")
+        return
+
+    new_text = update.message.text.strip()
+    if len(new_text) < 5:
+        await update.message.reply_text("⚠️ Слишком короткий текст. Попробуй ещё раз.")
+        context.user_data["editing_review_id"] = review_id
+        return
+
+    item["post_text"] = new_text
+    await save_data()
+
+    await update.message.reply_text("✅ Текст обновлён. Вот новый пост:")
+    await send_post_for_review(context.application, review_id, item)
+    print(f"✏️ Отредактирован пост: {item['title'][:60]}")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -669,6 +730,16 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(find_and_send_next(context.application))
         return
 
+    if action == "edit":
+        context.user_data["editing_review_id"] = review_id
+        await safe_edit(
+            query,
+            f"✏️ Отправь новый текст для поста.\n\n"
+            f"Текущий текст:\n{item['post_text']}\n\n"
+            f"/cancel — отменить."
+        )
+        return
+
     if action == "publish":
         try:
             await publish_to_channel(context.application, item)
@@ -715,12 +786,16 @@ async def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("next", next_command))
-    application.add_handler(CommandHandler("now", now_command))
+    application.add_handler(CommandHandler("edit", edit_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(review_callback))
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_text)
+    )
     application.add_error_handler(error_handler)
 
     port = int(os.environ.get("PORT", "10000"))
