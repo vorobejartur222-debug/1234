@@ -3,3 +3,4 @@ python-telegram-bot==22.8
 feedparser>=6.0
 groq>=1.0
 requests>=2.32
+supabase>=2.0
