@@ -122,7 +122,6 @@ RSS_FEEDS = [
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
     "https://kulturomania.ru/rss/",
-    "https://aif.ru/rss/culture.php",
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
     "http://www.gazeta.ru/export/rss/autonews.xml",
