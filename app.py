@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+import urllib.request  # <--- ДОБАВЛЕНО для StayPresent
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -259,6 +260,33 @@ def health():
 
 
 # ============================================================
+# StayPresent: Механизм предотвращения засыпания на Render
+# ============================================================
+
+async def stay_present_loop():
+    """Фоновый пингер. Обращается к своему же URL, чтобы Render видел трафик."""
+    # Render автоматически подставляет переменную RENDER_EXTERNAL_URL
+    # Если её нет (локальный запуск), используем ваш URL
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://one234-0ioz.onrender.com")
+    ping_url = f"{base_url.rstrip('/')}/health"
+    
+    print(f"🔄 StayPresent активирован. Пингую {ping_url} каждые 10 минут.")
+    
+    while True:
+        try:
+            # Делаем асинхронный запрос, чтобы не блокировать работу бота
+            await asyncio.to_thread(
+                lambda: urllib.request.urlopen(ping_url, timeout=30).read()
+            )
+            print("📡 StayPresent: успешный пинг, Render не уснет.")
+        except Exception as e:
+            print(f"⚠️ StayPresent: ошибка пинга - {e}")
+            
+        # Ждем 10 минут (600 секунд). Этого достаточно, чтобы Render не уснул (лимит 15 мин)
+        await asyncio.sleep(600)
+
+
+# ============================================================
 # RSS: обработка
 # ============================================================
 
@@ -373,7 +401,7 @@ async def find_one_new_entry():
 
 
 # ============================================================
-# Groq: генерация — ВАЙБОВЫЙ ПРОМПТ (обновлён)
+# Groq: генерация
 # ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
@@ -477,7 +505,6 @@ async def safe_edit(query, text: str):
 
 
 async def send_post_for_review(app: Application, review_id: str, item: dict):
-    """Отправляет (или переотправляет) пост админу с кнопками."""
     message_text = f"📬 Пост на проверку\n\n{item['post_text']}"
     keyboard = build_keyboard(review_id)
     image_url = item.get("image_url")
@@ -622,7 +649,6 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает редактирование последнего поста в очереди."""
     if not await require_admin(update): return
 
     if not pending_queue:
@@ -826,6 +852,7 @@ async def main():
 
         background_tasks = [
             asyncio.create_task(schedule_loop(application), name="schedule"),
+            asyncio.create_task(stay_present_loop(), name="stay_present"), # <--- ДОБАВЛЕНО СЮДА
         ]
         print("✅ Бот запущен и готов к работе.")
 
