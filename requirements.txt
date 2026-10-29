@@ -4,3 +4,4 @@ feedparser>=6.0
 groq>=1.0
 requests>=2.32
 supabase>=2.0
+Pillow>=10.0.0
