@@ -2,6 +2,7 @@ import asyncio
 import fcntl
 import hashlib
 import html
+import io
 import json
 import os
 import random
@@ -11,7 +12,7 @@ import sys
 import threading
 import time
 import uuid
-import urllib.request  # <--- ДОБАВЛЕНО для StayPresent
+import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -19,6 +20,7 @@ import feedparser
 import requests
 from flask import Flask
 from groq import Groq
+from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client, Client
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -122,6 +124,7 @@ RSS_FEEDS = [
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
     "https://kulturomania.ru/rss/",
+    "https://aif.ru/rss/culture.php",
     "https://www.positive.news/feed/",
     "https://www.optimistdaily.com/feed/",
     "http://www.gazeta.ru/export/rss/autonews.xml",
@@ -132,7 +135,6 @@ RSS_FEEDS = [
     "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
     "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
     "https://aif.ru/rss/sport.php",
-    "https://aif.ru/rss/health.php",
 ]
 
 
@@ -263,9 +265,6 @@ def health():
 # ============================================================
 
 async def stay_present_loop():
-    """Фоновый пингер. Обращается к своему же URL, чтобы Render видел трафик."""
-    # Render автоматически подставляет переменную RENDER_EXTERNAL_URL
-    # Если её нет (локальный запуск), используем ваш URL
     base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://one234-0ioz.onrender.com")
     ping_url = f"{base_url.rstrip('/')}/health"
     
@@ -273,16 +272,70 @@ async def stay_present_loop():
     
     while True:
         try:
-            # Делаем асинхронный запрос, чтобы не блокировать работу бота
             await asyncio.to_thread(
                 lambda: urllib.request.urlopen(ping_url, timeout=30).read()
             )
             print("📡 StayPresent: успешный пинг, Render не уснет.")
         except Exception as e:
             print(f"⚠️ StayPresent: ошибка пинга - {e}")
-            
-        # Ждем 10 минут (600 секунд). Этого достаточно, чтобы Render не уснул (лимит 15 мин)
         await asyncio.sleep(600)
+
+
+# ============================================================
+# Водяной знак для изображений
+# ============================================================
+
+def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io.BytesIO:
+    """Скачивает картинку, накладывает прозрачный водяной знак без обводки."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(image_url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        img = Image.open(io.BytesIO(response.content)).convert("RGBA")
+        max_size = (1280, 1280)
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+        txt_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(txt_layer)
+
+        # Размер шрифта примерно 1/12 ширины
+        font_size = max(12, int(img.width * 0.025))
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", size=font_size)
+        except IOError:
+            try:
+                font = ImageFont.load_default(size=font_size)
+            except TypeError:
+                font = ImageFont.load_default()
+
+        if hasattr(draw, 'textbbox'):
+            bbox = draw.textbbox((0, 0), watermark_text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        else:
+            text_width, text_height = draw.textsize(watermark_text, font=font)
+
+        margin = 20
+        x = img.width - text_width - margin
+        y = img.height - text_height - margin
+
+        # Белый цвет, прозрачность 120 (из 255)
+        fill_color = (255, 255, 255, 120)
+        draw.text((x, y), watermark_text, font=font, fill=fill_color)
+
+        out = Image.alpha_composite(img, txt_layer)
+        out = out.convert("RGB")
+        
+        output = io.BytesIO()
+        out.save(output, format="JPEG", quality=85)
+        output.seek(0)
+        return output
+
+    except Exception as e:
+        print(f"⚠️ Ошибка при добавлении водяного знака: {e}")
+        return None
 
 
 # ============================================================
@@ -510,9 +563,12 @@ async def send_post_for_review(app: Application, review_id: str, item: dict):
 
     try:
         if image_url and len(item["post_text"]) <= 1024:
+            watermarked_image = await asyncio.to_thread(add_watermark_sync, image_url)
+            photo_to_send = watermarked_image if watermarked_image else image_url
+            
             await app.bot.send_photo(
                 chat_id=ADMIN_ID,
-                photo=image_url,
+                photo=photo_to_send,
                 caption=message_text,
                 reply_markup=keyboard,
             )
@@ -612,11 +668,16 @@ async def publish_to_channel(app: Application, item: dict):
 
     if image_url and len(post_text) <= 1024:
         try:
+            watermarked_image = await asyncio.to_thread(add_watermark_sync, image_url)
+            photo_to_send = watermarked_image if watermarked_image else image_url
+            
             return await app.bot.send_photo(
-                chat_id=CHANNEL_ID, photo=image_url, caption=post_text,
+                chat_id=CHANNEL_ID, photo=photo_to_send, caption=post_text,
             )
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Ошибка при отправке фото с водяным знаком: {e}")
             pass
+            
     return await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
 
 
@@ -851,7 +912,7 @@ async def main():
 
         background_tasks = [
             asyncio.create_task(schedule_loop(application), name="schedule"),
-            asyncio.create_task(stay_present_loop(), name="stay_present"), # <--- ДОБАВЛЕНО СЮДА
+            asyncio.create_task(stay_present_loop(), name="stay_present"),
         ]
         print("✅ Бот запущен и готов к работе.")
 
