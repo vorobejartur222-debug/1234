@@ -158,23 +158,30 @@ pending_queue = _data["pending"]
 
 def load_data_sync():
     global _data, pending_queue, _seen_set
-    try:
-        response = supabase.table("bot_data").select("data").eq("id", 1).execute()
-        if not response.data:
-            _data = dict(DEFAULT_DATA)
-        else:
-            loaded = response.data[0].get("data") or {}
-            if isinstance(loaded, str):
-                loaded = json.loads(loaded)
-            _data = dict(DEFAULT_DATA)
-            _data.update(loaded)
-            _data.setdefault("items", [])
-            _data.setdefault("pending", {})
-            _data.setdefault("stats", {"published": 0, "skipped": 0, "sources": {}})
-            _data.setdefault("last_schedule_slot", "")
-    except Exception as exc:
-        print(f"❌ Ошибка загрузки из Supabase: {type(exc).__name__}: {exc}")
-        _data = dict(DEFAULT_DATA)
+    # Добавляем 5 попыток подключения на случай, если Render еще не поднял сеть
+    for attempt in range(1, 6):
+        try:
+            response = supabase.table("bot_data").select("data").eq("id", 1).execute()
+            if not response.data:
+                _data = dict(DEFAULT_DATA)
+            else:
+                loaded = response.data[0].get("data") or {}
+                if isinstance(loaded, str):
+                    loaded = json.loads(loaded)
+                _data = dict(DEFAULT_DATA)
+                _data.update(loaded)
+                _data.setdefault("items", [])
+                _data.setdefault("pending", {})
+                _data.setdefault("stats", {"published": 0, "skipped": 0, "sources": {}})
+                _data.setdefault("last_schedule_slot", "")
+            break  # Если удалось, выходим из цикла
+        except Exception as exc:
+            print(f"⚠️ Попытка {attempt}/5 загрузки из Supabase: {type(exc).__name__}: {exc}")
+            if attempt == 5:
+                print("❌ Не удалось загрузить данные из Supabase. Использую пустую базу.")
+                _data = dict(DEFAULT_DATA)
+            else:
+                time.sleep(3)  # Ждем 3 секунды перед следующей попыткой
 
     pending_queue = _data["pending"]
     _seen_set = set(_data.get("items", []))
