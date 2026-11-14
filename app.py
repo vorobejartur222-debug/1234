@@ -12,7 +12,6 @@ import sys
 import threading
 import time
 import uuid
-import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -59,7 +58,8 @@ print(f"🔧 GROQ_MODEL = '{GROQ_MODEL}'")
 print(f"🔧 SUPABASE_URL = '{SUPABASE_URL}'")
 print(f"🔧 SUPABASE_KEY = {'задан' if SUPABASE_KEY else 'НЕ ЗАДАН'}")
 
-TIMEZONE_NAME = os.environ.get("TIMEZONE", "Europe/Minsk").strip()
+# Часовой пояс Москвы для авто-постинга в 18:00
+TIMEZONE_NAME = "Europe/Moscow"
 try:
     LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
 except ZoneInfoNotFoundError:
@@ -72,8 +72,6 @@ MAX_ENTRIES_PER_FEED = 15
 MAX_ATTEMPTS = 5
 FIND_TOTAL_TIMEOUT = 60
 GROQ_TIMEOUT = 20
-
-SCHEDULE_HOURS = {10, 14, 18, 22}
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -129,17 +127,15 @@ RSS_FEEDS = [
     "https://kulturomania.ru/rss/",
     "https://aif.ru/rss/culture.php",
 
-    # Позитив (замена нестабильного positive.news)
+    # Позитив
     "https://www.optimistdaily.com/feed/",
-    "https://www.goodnewsnetwork.org/feed/",  # <-- ДОБАВЛЕНА СТАБИЛЬНАЯ ЛЕНТА
+    "https://www.goodnewsnetwork.org/feed/",
 
     # Авто
     "https://aif.ru/rss/automobile.php",
-    # "http://www.gazeta.ru/export/rss/autonews.xml",  <-- УДАЛЕНО
 
-    # Кино (прямой RSS вместо прокси)
-    "https://www.kinopoisk.ru/news.rss",  # <-- ПРЯМОЙ RSS
-    # "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",  <-- УДАЛЕНО
+    # Кино
+    "https://www.kinopoisk.ru/news.rss",
 
     # Игры
     "https://www.playground.ru/rss/news",
@@ -162,7 +158,7 @@ DEFAULT_DATA = {
     "items": [],
     "pending": {},
     "stats": {"published": 0, "skipped": 0, "sources": {}},
-    "last_schedule_slot": "",
+    "last_auto_publish_date": "",
 }
 
 _data = dict(DEFAULT_DATA)
@@ -174,7 +170,6 @@ pending_queue = _data["pending"]
 
 def load_data_sync():
     global _data, pending_queue, _seen_set
-    # Добавляем 5 попыток подключения на случай, если Render еще не поднял сеть
     for attempt in range(1, 6):
         try:
             response = supabase.table("bot_data").select("data").eq("id", 1).execute()
@@ -189,15 +184,15 @@ def load_data_sync():
                 _data.setdefault("items", [])
                 _data.setdefault("pending", {})
                 _data.setdefault("stats", {"published": 0, "skipped": 0, "sources": {}})
-                _data.setdefault("last_schedule_slot", "")
-            break  # Если удалось, выходим из цикла
+                _data.setdefault("last_auto_publish_date", "")
+            break
         except Exception as exc:
             print(f"⚠️ Попытка {attempt}/5 загрузки из Supabase: {type(exc).__name__}: {exc}")
             if attempt == 5:
                 print("❌ Не удалось загрузить данные из Supabase. Использую пустую базу.")
                 _data = dict(DEFAULT_DATA)
             else:
-                time.sleep(3)  # Ждем 3 секунды перед следующей попыткой
+                time.sleep(3)
 
     pending_queue = _data["pending"]
     _seen_set = set(_data.get("items", []))
@@ -295,9 +290,7 @@ async def stay_present_loop():
     
     while True:
         try:
-            await asyncio.to_thread(
-                lambda: urllib.request.urlopen(ping_url, timeout=30).read()
-            )
+            await asyncio.to_thread(requests.get, ping_url, timeout=30)
             print("📡 StayPresent: успешный пинг, Render не уснет.")
         except Exception as e:
             print(f"⚠️ StayPresent: ошибка пинга - {e}")
@@ -309,7 +302,6 @@ async def stay_present_loop():
 # ============================================================
 
 def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io.BytesIO:
-    """Скачивает картинку, накладывает прозрачный водяной знак без обводки."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(image_url, headers=headers, timeout=10)
@@ -322,7 +314,6 @@ def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io
         txt_layer = Image.new("RGBA", img.size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(txt_layer)
 
-        # Размер шрифта примерно 1/12 ширины
         font_size = max(12, int(img.width * 0.025))
         
         try:
@@ -344,7 +335,6 @@ def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io
         x = img.width - text_width - margin
         y = img.height - text_height - margin
 
-        # Белый цвет, прозрачность 120 (из 255)
         fill_color = (255, 255, 255, 120)
         draw.text((x, y), watermark_text, font=font, fill=fill_color)
 
@@ -404,6 +394,7 @@ BLOCK_MARKERS = [
     "туториал", "руководство", "как я ", "как сделать", "how to", "tutorial",
     "война", "убит", "погиб", "теракт", "катастрофа", "трагедия", "авария", "смерть", "умер",
     "путин", "зеленск", "трамп", "байден", "нато", "санкц", "кремл", "госдум", "минобороны",
+    "москв", "парковк", "подъезд", "жкх", "собянин", "чиновник", "штраф", "запрет", "закон"
 ]
 
 
@@ -541,9 +532,13 @@ def rewrite_with_ai(title: str, summary: str):
             if not text:
                 print("⚠️ Groq: пустой текст после очистки")
                 continue
-            if text[-1] not in ".!?…»”":
+            
+            # Убираем эмодзи с конца для проверки, чтобы не отсеивать хорошие посты
+            text_for_check = re.sub(r'[^\w\s\.\!\?…»”]', '', text).strip()
+            if not text_for_check or text_for_check[-1] not in ".!?…»”":
                 print(f"⚠️ Groq: текст не заканчивается на точку — {text[-50:]!r}")
                 continue
+                
             if len(text) > 1000:
                 text = text[:997].rsplit(" ", 1)[0].rstrip() + "..."
             if len(re.sub(r"[^\wа-яА-ЯёЁ]+", "", text)) < 10:
@@ -721,7 +716,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/next — найти пост\n"
         "/edit — изменить последний пост\n"
         "/reset — сбросить историю\n"
-        "/stats — статистика"
+        "/stats — статистика\n\n"
+        "🤖 В 18:00 МСК бот сам опубликует 1 пост из очереди."
     )
 
 
@@ -868,19 +864,62 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Фоновые задачи и запуск
 # ============================================================
 
-async def schedule_loop(app: Application):
+async def auto_publish_loop(app: Application):
+    """Автоматически публикует 1 пост в канал каждый день в 18:00 по МСК."""
     while True:
         try:
             now = datetime.now(LOCAL_TZ)
-            if now.hour in SCHEDULE_HOURS:
-                slot = now.strftime("%Y-%m-%d-%H")
-                if _data.get("last_schedule_slot") != slot:
-                    _data["last_schedule_slot"] = slot
+            today = now.strftime("%Y-%m-%d")
+            
+            # Если сейчас ровно 18:00 и сегодня еще не публиковали
+            if now.hour == 18 and now.minute == 0 and _data.get("last_auto_publish_date") != today:
+                _data["last_auto_publish_date"] = today
+                await save_data()
+                print("⏰ 18:00 МСК! Запускаю авто-публикацию...")
+                
+                # 1. Если есть готовый пост в очереди — берем его
+                if pending_queue:
+                    review_id = list(pending_queue.keys())[0]
+                    item = pending_queue.pop(review_id)
+                    bump_stat("published")
                     await save_data()
-                    print(f"🕒 Плановый поиск, слот {slot}")
-                    await find_and_send_next(app)
+                    
+                    await publish_to_channel(app, item)
+                    await app.bot.send_message(
+                        chat_id=ADMIN_ID, 
+                        text=f"⏰ Авто-публикация в 18:00 (из очереди):\n{item['title'][:60]}"
+                    )
+                    print(f"✅ Авто-опубликован пост из очереди: {item['title'][:60]}")
+                else:
+                    # 2. Если очереди нет — ищем и публикуем сразу
+                    print("📭 Очередь пуста. Ищу свежую новость для авто-постинга...")
+                    candidate = await find_one_new_entry()
+                    if candidate:
+                        entry = candidate["entry"]
+                        title = candidate["title"]
+                        summary = get_summary(entry)
+                        raw_summary = getattr(entry, "summary", "") or ""
+                        image_url = extract_image(entry, raw_summary)
+                        post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
+
+                        if post_text:
+                            mark_seen(candidate["key"])
+                            bump_stat("published")
+                            await save_data()
+                            
+                            item = {"title": title, "post_text": post_text, "image_url": image_url}
+                            await publish_to_channel(app, item)
+                            await app.bot.send_message(
+                                chat_id=ADMIN_ID, 
+                                text=f"⏰ Авто-поиск и публикация в 18:00:\n{title[:60]}"
+                            )
+                            print(f"✅ Авто-опубликован найденный пост: {title[:60]}")
+                        else:
+                            await app.bot.send_message(chat_id=ADMIN_ID, text="⚠️ В 18:00 не удалось сгенерировать текст для авто-постинга.")
         except Exception as exc:
-            print(f"❌ Ошибка расписания: {type(exc).__name__}: {exc}")
+            print(f"❌ Ошибка авто-публикации: {type(exc).__name__}: {exc}")
+        
+        # Проверяем каждые 30 секунд
         await asyncio.sleep(30)
 
 
@@ -933,11 +972,12 @@ async def main():
         await asyncio.sleep(2)
         await application.updater.start_polling(drop_pending_updates=True)
 
+        # Запускаем фоновые задачи: пинг Render + Авто-постинг в 18:00
         background_tasks = [
-            asyncio.create_task(schedule_loop(application), name="schedule"),
+            asyncio.create_task(auto_publish_loop(application), name="auto_publish"),
             asyncio.create_task(stay_present_loop(), name="stay_present"),
         ]
-        print("✅ Бот запущен и готов к работе.")
+        print("✅ Бот запущен и готов к работе. Авто-постинг включен на 18:00 МСК.")
 
         await stop_event.wait()
     finally:
