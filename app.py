@@ -118,22 +118,38 @@ def release_lock():
 # ============================================================
 
 RSS_FEEDS = [
+    # Наука и технологии
     "https://nplus1.ru/rss",
     "https://naked-science.ru/feed",
     "https://www.ixbt.com/export/news.rss",
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
+
+    # Культура
     "https://kulturomania.ru/rss/",
     "https://aif.ru/rss/culture.php",
-    "https://www.positive.news/feed/",
+
+    # Позитив (замена нестабильного positive.news)
     "https://www.optimistdaily.com/feed/",
-    "http://www.gazeta.ru/export/rss/autonews.xml",
+    "https://www.goodnewsnetwork.org/feed/",  # <-- ДОБАВЛЕНА СТАБИЛЬНАЯ ЛЕНТА
+
+    # Авто
     "https://aif.ru/rss/automobile.php",
-    "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",
+    # "http://www.gazeta.ru/export/rss/autonews.xml",  <-- УДАЛЕНО
+
+    # Кино (прямой RSS вместо прокси)
+    "https://www.kinopoisk.ru/news.rss",  # <-- ПРЯМОЙ RSS
+    # "https://freenewsapi.ai/v1/rss?host=www.kinopoisk.ru&size=50",  <-- УДАЛЕНО
+
+    # Игры
     "https://www.playground.ru/rss/news",
+
+    # Беларусь
     "https://charter97.link/ru/page/rss/",
     "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
     "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
+
+    # Спорт
     "https://aif.ru/rss/sport.php",
 ]
 
