@@ -735,15 +735,21 @@ async def auto_publish_loop(app: Application):
 # ============================================================
 
 async def post_init(app: Application):
-    # Принудительно обновляем меню команд в Telegram, убирая старые (/now, /pending)
-    await app.bot.set_my_commands([
-        BotCommand("next", "Найти следующий пост"),
-        BotCommand("edit", "Редактировать текст"),
-        BotCommand("clear", "Очистить очередь"),
-        BotCommand("reset", "Сбросить историю"),
-        BotCommand("stats", "Показать статистику"),
-        BotCommand("start", "Запустить бота")
-    ])
+    try:
+        # Принудительно удаляем ВСЕ старые команды, чтобы стереть кэш Телеграма
+        await app.bot.delete_my_commands()
+        # Устанавливаем только актуальные
+        await app.bot.set_my_commands([
+            BotCommand("next", "Найти следующий пост"),
+            BotCommand("edit", "Редактировать текст"),
+            BotCommand("clear", "Очистить очередь"),
+            BotCommand("reset", "Сбросить историю"),
+            BotCommand("stats", "Показать статистику"),
+            BotCommand("start", "Запустить бота")
+        ])
+        print("✅ Меню команд Telegram обновлено.")
+    except Exception as e:
+        print(f"⚠️ Ошибка обновления меню: {e}")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     pass
