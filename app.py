@@ -63,10 +63,7 @@ try:
 except ZoneInfoNotFoundError:
     LOCAL_TZ = ZoneInfo("UTC")
 
-MAX_PARALLEL_FEEDS = 10
-FEED_TOTAL_TIMEOUT = 8
-MAX_ENTRIES_PER_FEED = 15
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 3
 FIND_TOTAL_TIMEOUT = 60
 GROQ_TIMEOUT = 20
 
@@ -75,57 +72,36 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================================
-# Защита от двойного запуска
+# Умная ротация RSS-источников
 # ============================================================
 
-LOCK_FILE = "/tmp/bot.lock"
-_LOCK_FD = None
+FEED_CATEGORIES = {
+    "science": [
+        "https://nplus1.ru/rss",
+        "https://naked-science.ru/feed",
+        "https://www.ixbt.com/export/news.rss",
+        "https://hi-news.ru/feed/",
+        "https://tproger.ru/feed/",
+    ],
+    "cinema": [
+        "https://www.kinopoisk.ru/news.rss",
+    ],
+    "games": [
+        "https://www.playground.ru/rss/news",
+    ],
+    "culture": [
+        "https://kulturomania.ru/rss/",
+        "https://aif.ru/rss/culture.php",
+    ],
+    "belarus": [
+        "https://charter97.link/ru/page/rss/",
+        "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
+        "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
+    ]
+}
 
-def acquire_lock():
-    global _LOCK_FD
-    _LOCK_FD = open(LOCK_FILE, "a+")
-    try:
-        fcntl.flock(_LOCK_FD.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (BlockingIOError, OSError):
-        _LOCK_FD.close()
-        print("⚠️ Бот уже запущен в этом контейнере.")
-        sys.exit(1)
-    _LOCK_FD.seek(0)
-    _LOCK_FD.truncate()
-    _LOCK_FD.write(str(os.getpid()))
-    _LOCK_FD.flush()
-
-def release_lock():
-    global _LOCK_FD
-    if _LOCK_FD:
-        try:
-            fcntl.flock(_LOCK_FD.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        _LOCK_FD.close()
-        _LOCK_FD = None
-
-
-# ============================================================
-# RSS-источники
-# ============================================================
-
-RSS_FEEDS = [
-    "https://nplus1.ru/rss",
-    "https://naked-science.ru/feed",
-    "https://www.ixbt.com/export/news.rss",
-    "https://hi-news.ru/feed/",
-    "https://tproger.ru/feed/",
-    "https://kulturomania.ru/rss/",
-    "https://aif.ru/rss/culture.php",
-    "https://aif.ru/rss/automobile.php",
-    "https://aif.ru/rss/sport.php",
-    "https://www.kinopoisk.ru/news.rss",
-    "https://www.playground.ru/rss/news",
-    "https://charter97.link/ru/page/rss/",
-    "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
-    "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
-]
+# Порядок очереди
+CATEGORY_ORDER = ["science", "cinema", "games", "culture", "belarus"]
 
 
 # ============================================================
@@ -135,7 +111,8 @@ RSS_FEEDS = [
 DEFAULT_DATA = {
     "items": [],
     "pending": {},
-    "last_skipped": None, # <-- Храним последний пропущенный пост
+    "last_skipped": None,
+    "last_category_index": -1, # Для ротации
     "stats": {
         "published": 0, 
         "skipped_by_admin": 0, 
@@ -168,6 +145,8 @@ def load_data_sync():
                 _data.setdefault("items", [])
                 _data.setdefault("pending", {})
                 _data.setdefault("last_skipped", None)
+                _data.setdefault("last_category_index", -1)
+                
                 stats = _data.setdefault("stats", {})
                 if "skipped" in stats and "skipped_by_admin" not in stats:
                     stats["skipped_by_admin"] = stats.pop("skipped")
@@ -246,7 +225,8 @@ def reset_seen():
     _data["items"] = []
     _data["stats"] = dict(DEFAULT_DATA["stats"])
     _data["last_skipped"] = None
-    print("🔄 Seen set и статистика сброшены")
+    _data["last_category_index"] = -1
+    print("🔄 Seen set, статистика и очередь сброшены")
 
 
 # ============================================================
@@ -320,12 +300,15 @@ def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io
         output.seek(0)
         return output
     except Exception as e:
+        print(f"⚠️ Ошибка при наложении водяного знака: {e}")
         return None
 
 def generate_ai_image(title: str) -> str:
+    """Генерирует картинку через Pollinations AI с рандомным seed для уникальности."""
     prompt = f"high quality photo, news illustration, {title}"
     encoded_prompt = urllib.parse.quote(prompt)
-    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
+    random_seed = random.randint(1, 1000000)
+    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true&seed={random_seed}"
 
 
 # ============================================================
@@ -376,90 +359,92 @@ def parse_feed_sync(feed_url: str):
     response.raise_for_status()
     return feedparser.parse(response.content)
 
-async def fetch_fresh_from_feed(feed_url: str, semaphore: asyncio.Semaphore):
-    async with semaphore:
-        try:
-            feed = await asyncio.wait_for(asyncio.to_thread(parse_feed_sync, feed_url), timeout=FEED_TOTAL_TIMEOUT)
-            fresh = []
-            for entry in feed.entries[:MAX_ENTRIES_PER_FEED]:
-                title = clean_html(getattr(entry, "title", "") or "") or "Без заголовка"
-                key = get_item_key(entry, feed_url, title)
-                if is_seen(key): continue
-                summary = get_summary(entry)
-                if not is_news_item(title, summary):
-                    mark_seen(key)
-                    continue
-                fresh.append({"entry": entry, "title": title, "feed_url": feed_url, "key": key})
-            return fresh
-        except Exception:
-            return []
+async def fetch_fresh_from_feed(feed_url: str):
+    try:
+        feed = await asyncio.to_thread(parse_feed_sync, feed_url)
+        fresh = []
+        for entry in feed.entries[:10]:
+            title = clean_html(getattr(entry, "title", "") or "") or "Без заголовка"
+            key = get_item_key(entry, feed_url, title)
+            if is_seen(key): continue
+            summary = get_summary(entry)
+            if not is_news_item(title, summary):
+                mark_seen(key)
+                continue
+            fresh.append({"entry": entry, "title": title, "feed_url": feed_url, "key": key})
+        return fresh
+    except Exception:
+        return []
 
 async def find_one_new_entry():
-    feeds = list(RSS_FEEDS)
+    """Умный поиск по ротации категорий."""
+    
+    # Определяем следующую категорию
+    current_index = _data.get("last_category_index", -1)
+    next_index = (current_index + 1) % len(CATEGORY_ORDER)
+    category = CATEGORY_ORDER[next_index]
+    
+    feeds = list(FEED_CATEGORIES[category])
     random.shuffle(feeds)
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_FEEDS)
-    tasks = [asyncio.create_task(fetch_fresh_from_feed(url, semaphore)) for url in feeds]
+    
+    print(f"🔎 Очередь ротации: ищу в категории '{category.upper()}'")
 
-    try:
-        while tasks:
-            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                try:
-                    fresh = task.result()
-                except Exception: continue
-                if fresh:
-                    for t in tasks: t.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    return random.choice(fresh)
-        return None
-    except asyncio.CancelledError:
-        return None
+    for feed_url in feeds:
+        fresh = await fetch_fresh_from_feed(feed_url)
+        if fresh:
+            # Если нашли новость, сдвигаем очередь в Supabase
+            _data["last_category_index"] = next_index
+            await save_data()
+            return random.choice(fresh)
+            
+    # Если в этой категории пусто, ищем в остальных (запасной вариант)
+    print(f"⚠️ В категории '{category.upper()}' пусто. Ищу везде...")
+    all_feeds = [f for cat_feeds in FEED_CATEGORIES.values() for f in cat_feeds]
+    random.shuffle(all_feeds)
+    
+    for feed_url in all_feeds:
+        fresh = await fetch_fresh_from_feed(feed_url)
+        if fresh:
+            return random.choice(fresh)
+
+    return None
 
 
 # ============================================================
-# Groq: генерация (с хэштегами)
+# Groq: генерация (Строгий и понятный промпт)
 # ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
     if not groq_client: return None
 
-    prompt = f"""Ты — автор молодёжного Telegram-канала +VIBE NEWS.
-Аудитория: страны СНГ (Россия, Беларусь, Казахстан и т.д.).
+    prompt = f"""Ты — профессиональный редактор Telegram-канала +VIBE NEWS.
+Твоя задача: взять факты из источника и написать связный пост на русском языке.
 
-ТВОЯ ЗАДАЧА:
-Написать пост ИЛИ отклонить новость, если она не подходит.
-
-ПРАВИЛА ОТКЛОНЕНИЯ (верни ровно слово ОТКАЗ, если):
-- Событие произошло в США, Азии или Африке и НЕ является глобальным научным открытием. Локальные новости США (например, "в Калифорнии родился дельфин") — ОТКАЗ.
-- Новость из Европы, но это скучный локальный быт. Европа разрешена, если это наука, культура, спорт.
-- Текст источника — это бред, ошибка перевода или бессмыслица.
-
-ПРАВИЛА НАПИСАНИЯ (если новость одобрена):
-- Переведи на русский, если оригинал на английском/белорусском.
-- Пиши живо, но БЕЗ тупых шуток. Если новость про медицину — пиши уважительно.
-- Запрещено писать "врачебный жаргон для...". Запрещены странные сравнения.
-- Только факты из источника. Ничего не выдумывай.
-- Не пиши «новость», «сообщается», «по данным».
+ПРАВИЛА:
+1. Если новость про США, Африку или скучный быт — верни ровно слово ОТКАЗ.
+2. Пиши строго по фактам. Не выдумывай ничего от себя.
+3. Текст должен быть логичным и связным. Никаких рубленых фраз или бреда.
+4. Если оригинал на английском — переведи.
+5. Никакого кринжа. Если новость про медицину — пиши нейтрально.
 
 ФОРМАТ:
-- 3-4 предложения, до 700 символов.
-- РОВНО 2 эмодзи в тексте.
-- Закончи полной фразой с точкой, вопросительным или восклицательным знаком.
-- С новой строки добавь 1-2 хэштега по теме (например: #Наука #Технологии).
-- Без ссылок.
+- 3-4 предложения.
+- Ровно 2 эмодзи (одно в начале, одно по смыслу в тексте).
+- В самом конце добавь 1-2 хэштега (например: #Наука #Кино).
+- Без ссылок и лишних заголовков.
 
 Заголовок: {title}
 Описание: {summary}
 
-Твой ответ (текст поста или ОТКАЗ):"""
+Напиши только текст поста (или ОТКАЗ):"""
 
     for attempt in range(3):
         try:
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=1200,
+                temperature=0.5, # Снизили температуру для логики
+                max_tokens=1000,
                 timeout=GROQ_TIMEOUT,
             )
             if not response.choices: continue
@@ -473,11 +458,6 @@ def rewrite_with_ai(title: str, summary: str):
 
             text = re.sub(r"https?://\S+", "", text).strip()
             if not text: continue
-            
-            text_for_check = re.sub(r'#\w+', '', text).strip()
-            text_for_check = re.sub(r'[^\w\s\.\!\?…»”]', '', text_for_check).strip()
-            
-            if not text_for_check or text_for_check[-1] not in ".!?…»”": continue
                 
             if len(text) > 1000: text = text[:997].rsplit(" ", 1)[0].rstrip() + "..."
             return text
@@ -512,7 +492,6 @@ async def safe_edit(query, text: str):
 
 async def send_post_for_review(app: Application, review_id: str, item: dict):
     message_text = f"📬 Пост на проверку\n\n{item['post_text']}"
-    # Если есть сохраненный пост для отмены, показываем кнопку "Вернуть"
     show_undo = bool(_data.get("last_skipped"))
     keyboard = build_keyboard(review_id, show_undo)
     image_url = item.get("image_url")
@@ -544,7 +523,7 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         
         image_url = extract_image(entry, raw_summary)
         if not image_url:
-            print("🎨 Картинка не найдена, генерирую через ИИ...")
+            print("🎨 Генерирую картинку через ИИ...")
             image_url = generate_ai_image(title)
 
         post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
@@ -638,7 +617,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
-        "/undo — вернуть случайно пропущенный пост\n"
+        "/undo — вернуть пропущенный пост\n"
         "/edit — изменить последний\n"
         "/clear — очистить очередь постов\n"
         "/reset — сбросить историю\n"
@@ -708,19 +687,24 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     reset_seen()
     await save_data()
-    await update.effective_message.reply_text("🔄 История и статистика сброшены.")
+    await update.effective_message.reply_text("🔄 История, статистика и очередь категорий сброшены.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     stats = _data.get("stats", {})
     
+    # Определяем, что пойдет следующим
+    current_index = _data.get("last_category_index", -1)
+    next_index = (current_index + 1) % len(CATEGORY_ORDER)
+    next_cat = CATEGORY_ORDER[next_index].upper()
+    
     text = (
         "📊 **Статистика**\n\n"
         f"✅ Опубликовано: {stats.get('published', 0)}\n"
-        f"🙈 Отфильтровано ботом (ИИ/фильтры): {stats.get('skipped_by_ai', 0)}\n"
+        f"🙈 Отфильтровано ботом: {stats.get('skipped_by_ai', 0)}\n"
         f"⏭️ Пропущено тобой: {stats.get('skipped_by_admin', 0)}\n"
-        f"📥 Ждут решения: {len(pending_queue)}\n"
-        f"👁 Всего просмотрено: {len(_seen_set)}"
+        f"📥 Ждут решения: {len(pending_queue)}\n\n"
+        f"🔄 Следующая категория: {next_cat}"
     )
     await update.effective_message.reply_text(text, parse_mode='Markdown')
 
@@ -739,7 +723,6 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, "Нечего возвращать.")
             return
             
-        # Удаляем текущий пост из очереди, чтобы вернуть предыдущий
         if review_id in pending_queue:
              pending_queue.pop(review_id, None)
              
@@ -758,7 +741,6 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "skip":
-        # Сохраняем пост в last_skipped перед удалением
         _data["last_skipped"] = item
         pending_queue.pop(review_id, None)
         bump_stat("skipped_by_admin") 
@@ -777,7 +759,6 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await publish_to_channel(context.application, item)
             pending_queue.pop(review_id, None)
-            # При публикации очищаем историю отмены, так как пост улетел в канал
             _data["last_skipped"] = None
             bump_stat("published")
             await save_data()
@@ -804,7 +785,7 @@ async def auto_publish_loop(app: Application):
                 if pending_queue:
                     review_id = list(pending_queue.keys())[0]
                     item = pending_queue.pop(review_id)
-                    _data["last_skipped"] = None # Сбрасываем при авто-пуше
+                    _data["last_skipped"] = None 
                     bump_stat("published")
                     await save_data()
                     await publish_to_channel(app, item)
@@ -842,7 +823,7 @@ async def post_init(app: Application):
         await app.bot.delete_my_commands()
         await app.bot.set_my_commands([
             BotCommand("next", "Найти следующий пост"),
-            BotCommand("undo", "Вернуть пропущенный пост"),
+            BotCommand("undo", "Вернуть пропущенный"),
             BotCommand("edit", "Редактировать текст"),
             BotCommand("clear", "Очистить очередь"),
             BotCommand("reset", "Сбросить историю"),
