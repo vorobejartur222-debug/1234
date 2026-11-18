@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -110,24 +111,17 @@ def release_lock():
 # ============================================================
 
 RSS_FEEDS = [
-    # Наука и технологии (Глобальные и РФ)
     "https://nplus1.ru/rss",
     "https://naked-science.ru/feed",
     "https://www.ixbt.com/export/news.rss",
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
-
-    # Культура и авто (РФ)
     "https://kulturomania.ru/rss/",
     "https://aif.ru/rss/culture.php",
     "https://aif.ru/rss/automobile.php",
     "https://aif.ru/rss/sport.php",
-
-    # Кино и Игры
     "https://www.kinopoisk.ru/news.rss",
     "https://www.playground.ru/rss/news",
-
-    # Беларусь
     "https://charter97.link/ru/page/rss/",
     "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
     "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
@@ -280,13 +274,13 @@ async def stay_present_loop():
 
 
 # ============================================================
-# Водяной знак
+# Водяной знак + Генерация картинок
 # ============================================================
 
 def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io.BytesIO:
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(image_url, headers=headers, timeout=10)
+        response = requests.get(image_url, headers=headers, timeout=15)
         response.raise_for_status()
 
         img = Image.open(io.BytesIO(response.content)).convert("RGBA")
@@ -322,8 +316,16 @@ def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io
         out.save(output, format="JPEG", quality=85)
         output.seek(0)
         return output
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Ошибка при наложении водяного знака: {e}")
         return None
+
+def generate_ai_image(title: str) -> str:
+    """Генерирует картинку через бесплатный Pollinations AI на основе заголовка."""
+    prompt = f"high quality photo, news illustration, {title}"
+    encoded_prompt = urllib.parse.quote(prompt)
+    # Генерируем картинку 16:9
+    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
 
 
 # ============================================================
@@ -415,7 +417,7 @@ async def find_one_new_entry():
 
 
 # ============================================================
-# Groq: генерация с гео-фильтром
+# Groq: генерация (с хэштегами)
 # ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
@@ -429,21 +431,22 @@ def rewrite_with_ai(title: str, summary: str):
 
 ПРАВИЛА ОТКЛОНЕНИЯ (верни ровно слово ОТКАЗ, если):
 - Событие произошло в США, Азии или Африке и НЕ является глобальным научным открытием. Локальные новости США (например, "в Калифорнии родился дельфин") — ОТКАЗ.
-- Новость из Европы, но это скучный локальный быт (например, "в одном немецком городе поменяли лавочки"). Европа разрешена, если это касается науки, технологий, культуры, спорта или важных мировых событий.
+- Новость из Европы, но это скучный локальный быт. Европа разрешена, если это наука, культура, спорт.
 - Текст источника — это бред, ошибка перевода или бессмыслица.
 
 ПРАВИЛА НАПИСАНИЯ (если новость одобрена):
 - Переведи на русский, если оригинал на английском/белорусском.
-- Пиши живо, но БЕЗ тупых шуток. Если новость про медицину или науку — пиши уважительно и по факту.
+- Пиши живо, но БЕЗ тупых шуток. Если новость про медицину — пиши уважительно.
 - Запрещено писать "врачебный жаргон для...". Запрещены странные сравнения.
 - Только факты из источника. Ничего не выдумывай.
 - Не пиши «новость», «сообщается», «по данным».
 
 ФОРМАТ:
 - 3-4 предложения, до 700 символов.
-- РОВНО 2 эмодзи.
+- РОВНО 2 эмодзи в тексте.
 - Закончи полной фразой с точкой, вопросительным или восклицательным знаком.
-- Без ссылок, хэштегов.
+- С новой строки добавь 1-2 хэштега по теме (например: #Наука #Технологии).
+- Без ссылок.
 
 Заголовок: {title}
 Описание: {summary}
@@ -471,7 +474,10 @@ def rewrite_with_ai(title: str, summary: str):
             text = re.sub(r"https?://\S+", "", text).strip()
             if not text: continue
             
-            text_for_check = re.sub(r'[^\w\s\.\!\?…»”]', '', text).strip()
+            # Убираем хэштеги для проверки на точку в конце
+            text_for_check = re.sub(r'#\w+', '', text).strip()
+            text_for_check = re.sub(r'[^\w\s\.\!\?…»”]', '', text_for_check).strip()
+            
             if not text_for_check or text_for_check[-1] not in ".!?…»”": continue
                 
             if len(text) > 1000: text = text[:997].rsplit(" ", 1)[0].rstrip() + "..."
@@ -530,12 +536,17 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         summary = get_summary(entry)
         source_url = getattr(entry, "link", "") or ""
         raw_summary = getattr(entry, "summary", "") or ""
+        
+        # Генерация картинки, если нет в RSS
         image_url = extract_image(entry, raw_summary)
+        if not image_url:
+            print("🎨 Картинка не найдена, генерирую через ИИ...")
+            image_url = generate_ai_image(title)
 
         post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
         if post_text == "ОТКАЗ":
-            print(f"🚫 AI отклонил новость (не подходит по гео/смыслу): {title[:80]}")
+            print(f"🚫 AI отклонил новость: {title[:80]}")
             mark_seen(candidate["key"])
             bump_stat("skipped_by_ai")
             await save_data()
@@ -584,15 +595,32 @@ async def find_and_send_next(app: Application, max_attempts: int = MAX_ATTEMPTS)
 async def publish_to_channel(app: Application, item: dict):
     post_text = item["post_text"]
     image_url = item.get("image_url")
+    source_url = item.get("source_url")
+
+    # Кнопка "Читать оригинал"
+    reply_markup = None
+    if source_url:
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔗 Читать оригинал", url=source_url)
+        ]])
 
     if image_url and len(post_text) <= 1024:
         try:
             watermarked_image = await asyncio.to_thread(add_watermark_sync, image_url)
             photo_to_send = watermarked_image if watermarked_image else image_url
-            return await app.bot.send_photo(chat_id=CHANNEL_ID, photo=photo_to_send, caption=post_text)
+            return await app.bot.send_photo(
+                chat_id=CHANNEL_ID, 
+                photo=photo_to_send, 
+                caption=post_text,
+                reply_markup=reply_markup
+            )
         except Exception: pass
             
-    return await app.bot.send_message(chat_id=CHANNEL_ID, text=post_text[:4096])
+    return await app.bot.send_message(
+        chat_id=CHANNEL_ID, 
+        text=post_text[:4096],
+        reply_markup=reply_markup
+    )
 
 
 # ============================================================
@@ -742,14 +770,19 @@ async def auto_publish_loop(app: Application):
                     if candidate:
                         title = candidate["title"]
                         summary = get_summary(candidate["entry"])
+                        
                         image_url = extract_image(candidate["entry"], getattr(candidate["entry"], "summary", ""))
+                        if not image_url:
+                            image_url = generate_ai_image(title)
+                            
                         post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
+                        source_url = getattr(candidate["entry"], "link", "") or ""
 
                         if post_text and post_text != "ОТКАЗ":
                             mark_seen(candidate["key"])
                             bump_stat("published")
                             await save_data()
-                            item = {"title": title, "post_text": post_text, "image_url": image_url}
+                            item = {"title": title, "post_text": post_text, "image_url": image_url, "source_url": source_url}
                             await publish_to_channel(app, item)
                             await app.bot.send_message(chat_id=ADMIN_ID, text=f"⏰ Авто-поиск и публикация:\n{title[:60]}")
         except Exception: pass
