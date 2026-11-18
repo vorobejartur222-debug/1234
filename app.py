@@ -110,22 +110,27 @@ def release_lock():
 # ============================================================
 
 RSS_FEEDS = [
+    # Наука и технологии (Глобальные и РФ)
     "https://nplus1.ru/rss",
     "https://naked-science.ru/feed",
     "https://www.ixbt.com/export/news.rss",
     "https://hi-news.ru/feed/",
     "https://tproger.ru/feed/",
+
+    # Культура и авто (РФ)
     "https://kulturomania.ru/rss/",
     "https://aif.ru/rss/culture.php",
-    "https://www.optimistdaily.com/feed/",
-    "https://www.goodnewsnetwork.org/feed/",
     "https://aif.ru/rss/automobile.php",
+    "https://aif.ru/rss/sport.php",
+
+    # Кино и Игры
     "https://www.kinopoisk.ru/news.rss",
     "https://www.playground.ru/rss/news",
+
+    # Беларусь
     "https://charter97.link/ru/page/rss/",
     "https://krupki.gov.by/ru/novosti-regiona?format=feed&Itemid=274",
     "https://freenewsapi.ai/v1/rss?host=news.by&size=50",
-    "https://aif.ru/rss/sport.php",
 ]
 
 
@@ -410,18 +415,28 @@ async def find_one_new_entry():
 
 
 # ============================================================
-# Groq: генерация
+# Groq: генерация с гео-фильтром
 # ============================================================
 
 def rewrite_with_ai(title: str, summary: str):
     if not groq_client: return None
 
     prompt = f"""Ты — автор молодёжного Telegram-канала +VIBE NEWS.
-Пиши живо, с лёгким юмором. Как будто рассказываешь другу.
+Аудитория: страны СНГ (Россия, Беларусь, Казахстан и т.д.).
 
-ВАЖНО:
-- Если заголовок на английском/белорусском — ПЕРЕВЕДИ.
-- Только одно событие. Используй только факты.
+ТВОЯ ЗАДАЧА:
+Написать пост ИЛИ отклонить новость, если она не подходит.
+
+ПРАВИЛА ОТКЛОНЕНИЯ (верни ровно слово ОТКАЗ, если):
+- Событие произошло в США, Азии или Африке и НЕ является глобальным научным открытием. Локальные новости США (например, "в Калифорнии родился дельфин") — ОТКАЗ.
+- Новость из Европы, но это скучный локальный быт (например, "в одном немецком городе поменяли лавочки"). Европа разрешена, если это касается науки, технологий, культуры, спорта или важных мировых событий.
+- Текст источника — это бред, ошибка перевода или бессмыслица.
+
+ПРАВИЛА НАПИСАНИЯ (если новость одобрена):
+- Переведи на русский, если оригинал на английском/белорусском.
+- Пиши живо, но БЕЗ тупых шуток. Если новость про медицину или науку — пиши уважительно и по факту.
+- Запрещено писать "врачебный жаргон для...". Запрещены странные сравнения.
+- Только факты из источника. Ничего не выдумывай.
 - Не пиши «новость», «сообщается», «по данным».
 
 ФОРМАТ:
@@ -433,20 +448,24 @@ def rewrite_with_ai(title: str, summary: str):
 Заголовок: {title}
 Описание: {summary}
 
-Текст поста:"""
+Твой ответ (текст поста или ОТКАЗ):"""
 
     for attempt in range(3):
         try:
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.85,
+                temperature=0.7,
                 max_tokens=1200,
                 timeout=GROQ_TIMEOUT,
             )
             if not response.choices: continue
 
             text = (response.choices[0].message.content or "").strip()
+            
+            if text.upper().startswith("ОТКАЗ") or text == "ОТКАЗ":
+                return "ОТКАЗ"
+
             if getattr(response.choices[0], "finish_reason", None) == "length": continue
 
             text = re.sub(r"https?://\S+", "", text).strip()
@@ -514,6 +533,13 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         image_url = extract_image(entry, raw_summary)
 
         post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
+
+        if post_text == "ОТКАЗ":
+            print(f"🚫 AI отклонил новость (не подходит по гео/смыслу): {title[:80]}")
+            mark_seen(candidate["key"])
+            bump_stat("skipped_by_ai")
+            await save_data()
+            continue
 
         if not post_text:
             print(f"⏭️ AI не справился: {title[:80]}")
@@ -719,7 +745,7 @@ async def auto_publish_loop(app: Application):
                         image_url = extract_image(candidate["entry"], getattr(candidate["entry"], "summary", ""))
                         post_text = await asyncio.to_thread(rewrite_with_ai, title, summary)
 
-                        if post_text:
+                        if post_text and post_text != "ОТКАЗ":
                             mark_seen(candidate["key"])
                             bump_stat("published")
                             await save_data()
@@ -736,9 +762,7 @@ async def auto_publish_loop(app: Application):
 
 async def post_init(app: Application):
     try:
-        # Принудительно удаляем ВСЕ старые команды, чтобы стереть кэш Телеграма
         await app.bot.delete_my_commands()
-        # Устанавливаем только актуальные
         await app.bot.set_my_commands([
             BotCommand("next", "Найти следующий пост"),
             BotCommand("edit", "Редактировать текст"),
