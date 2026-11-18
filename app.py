@@ -135,6 +135,7 @@ RSS_FEEDS = [
 DEFAULT_DATA = {
     "items": [],
     "pending": {},
+    "last_skipped": None, # <-- Храним последний пропущенный пост
     "stats": {
         "published": 0, 
         "skipped_by_admin": 0, 
@@ -166,6 +167,7 @@ def load_data_sync():
                 _data.update(loaded)
                 _data.setdefault("items", [])
                 _data.setdefault("pending", {})
+                _data.setdefault("last_skipped", None)
                 stats = _data.setdefault("stats", {})
                 if "skipped" in stats and "skipped_by_admin" not in stats:
                     stats["skipped_by_admin"] = stats.pop("skipped")
@@ -243,6 +245,7 @@ def reset_seen():
     _seen_set.clear()
     _data["items"] = []
     _data["stats"] = dict(DEFAULT_DATA["stats"])
+    _data["last_skipped"] = None
     print("🔄 Seen set и статистика сброшены")
 
 
@@ -317,14 +320,11 @@ def add_watermark_sync(image_url: str, watermark_text: str = "+VIBE NEWS") -> io
         output.seek(0)
         return output
     except Exception as e:
-        print(f"⚠️ Ошибка при наложении водяного знака: {e}")
         return None
 
 def generate_ai_image(title: str) -> str:
-    """Генерирует картинку через бесплатный Pollinations AI на основе заголовка."""
     prompt = f"high quality photo, news illustration, {title}"
     encoded_prompt = urllib.parse.quote(prompt)
-    # Генерируем картинку 16:9
     return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=576&nologo=true"
 
 
@@ -474,7 +474,6 @@ def rewrite_with_ai(title: str, summary: str):
             text = re.sub(r"https?://\S+", "", text).strip()
             if not text: continue
             
-            # Убираем хэштеги для проверки на точку в конце
             text_for_check = re.sub(r'#\w+', '', text).strip()
             text_for_check = re.sub(r'[^\w\s\.\!\?…»”]', '', text_for_check).strip()
             
@@ -492,12 +491,16 @@ def rewrite_with_ai(title: str, summary: str):
 # Telegram: отправка и модерация
 # ============================================================
 
-def build_keyboard(review_id: str):
-    return InlineKeyboardMarkup([[
+def build_keyboard(review_id: str, show_undo: bool = False):
+    buttons = [
         InlineKeyboardButton("🚀 Опубликовать", callback_data=f"publish:{review_id}"),
-        InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{review_id}"),
-        InlineKeyboardButton("⏭️ Дальше", callback_data=f"skip:{review_id}"),
-    ]])
+        InlineKeyboardButton("✏️ Изменить", callback_data=f"edit:{review_id}")
+    ]
+    if show_undo:
+        buttons.append(InlineKeyboardButton("↩️ Вернуть", callback_data="undo:last"))
+        
+    buttons.append(InlineKeyboardButton("⏭️ Дальше", callback_data=f"skip:{review_id}"))
+    return InlineKeyboardMarkup([buttons])
 
 async def safe_edit(query, text: str):
     try:
@@ -509,7 +512,9 @@ async def safe_edit(query, text: str):
 
 async def send_post_for_review(app: Application, review_id: str, item: dict):
     message_text = f"📬 Пост на проверку\n\n{item['post_text']}"
-    keyboard = build_keyboard(review_id)
+    # Если есть сохраненный пост для отмены, показываем кнопку "Вернуть"
+    show_undo = bool(_data.get("last_skipped"))
+    keyboard = build_keyboard(review_id, show_undo)
     image_url = item.get("image_url")
 
     try:
@@ -537,7 +542,6 @@ async def _find_and_send_next_inner(app: Application, max_attempts: int):
         source_url = getattr(entry, "link", "") or ""
         raw_summary = getattr(entry, "summary", "") or ""
         
-        # Генерация картинки, если нет в RSS
         image_url = extract_image(entry, raw_summary)
         if not image_url:
             print("🎨 Картинка не найдена, генерирую через ИИ...")
@@ -597,7 +601,6 @@ async def publish_to_channel(app: Application, item: dict):
     image_url = item.get("image_url")
     source_url = item.get("source_url")
 
-    # Кнопка "Читать оригинал"
     reply_markup = None
     if source_url:
         reply_markup = InlineKeyboardMarkup([[
@@ -635,6 +638,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Привет! Я готовлю посты для проверки.\n\n"
         "/next — найти пост\n"
+        "/undo — вернуть случайно пропущенный пост\n"
         "/edit — изменить последний\n"
         "/clear — очистить очередь постов\n"
         "/reset — сбросить историю\n"
@@ -645,6 +649,21 @@ async def next_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
     await update.effective_message.reply_text("🔎 Ищу материал...")
     asyncio.create_task(find_and_send_next(context.application))
+
+async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update): return
+    last = _data.get("last_skipped")
+    if not last:
+        await update.effective_message.reply_text("Нечего возвращать. Нет недавно пропущенных постов.")
+        return
+        
+    review_id = uuid.uuid4().hex[:8]
+    pending_queue[review_id] = last
+    _data["last_skipped"] = None
+    await save_data()
+    
+    await update.effective_message.reply_text("↩️ Возвращаю предыдущий пост:")
+    await send_post_for_review(context.application, review_id, last)
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update): return
@@ -714,15 +733,37 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action, review_id = query.data.split(":", 1)
     except: return
 
+    if action == "undo":
+        last = _data.get("last_skipped")
+        if not last:
+            await safe_edit(query, "Нечего возвращать.")
+            return
+            
+        # Удаляем текущий пост из очереди, чтобы вернуть предыдущий
+        if review_id in pending_queue:
+             pending_queue.pop(review_id, None)
+             
+        new_review_id = uuid.uuid4().hex[:8]
+        pending_queue[new_review_id] = last
+        _data["last_skipped"] = None
+        await save_data()
+        
+        await safe_edit(query, "↩️ Возвращаю предыдущий пост...")
+        await send_post_for_review(context.application, new_review_id, last)
+        return
+
     item = pending_queue.get(review_id)
     if not item:
         await safe_edit(query, "Эта публикация уже обработана.")
         return
 
     if action == "skip":
+        # Сохраняем пост в last_skipped перед удалением
+        _data["last_skipped"] = item
         pending_queue.pop(review_id, None)
         bump_stat("skipped_by_admin") 
         await save_data()
+        
         await safe_edit(query, "⏭️ Пропущено. Ищу следующий материал...")
         asyncio.create_task(find_and_send_next(context.application))
         return
@@ -736,6 +777,8 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await publish_to_channel(context.application, item)
             pending_queue.pop(review_id, None)
+            # При публикации очищаем историю отмены, так как пост улетел в канал
+            _data["last_skipped"] = None
             bump_stat("published")
             await save_data()
             await safe_edit(query, f"✅ Опубликовано: {item['title'][:60]}")
@@ -761,6 +804,7 @@ async def auto_publish_loop(app: Application):
                 if pending_queue:
                     review_id = list(pending_queue.keys())[0]
                     item = pending_queue.pop(review_id)
+                    _data["last_skipped"] = None # Сбрасываем при авто-пуше
                     bump_stat("published")
                     await save_data()
                     await publish_to_channel(app, item)
@@ -798,6 +842,7 @@ async def post_init(app: Application):
         await app.bot.delete_my_commands()
         await app.bot.set_my_commands([
             BotCommand("next", "Найти следующий пост"),
+            BotCommand("undo", "Вернуть пропущенный пост"),
             BotCommand("edit", "Редактировать текст"),
             BotCommand("clear", "Очистить очередь"),
             BotCommand("reset", "Сбросить историю"),
@@ -824,6 +869,7 @@ async def main():
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("next", next_command))
+    application.add_handler(CommandHandler("undo", undo_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("edit", edit_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
